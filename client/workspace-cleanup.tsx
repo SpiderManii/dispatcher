@@ -3,7 +3,7 @@ import { useToast } from "@getpaseo/plugin/client/ui";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { Pressable, Text, View } from "react-native";
-import { archiveWorkspacesRpc, workspacesRpc, type WorkspaceItem } from "../shared/contracts";
+import { archiveWorkspacesRpc, pushArchiveWorkspacesRpc, workspacesRpc, type WorkspaceItem } from "../shared/contracts";
 import { ConfirmDialog, type ConfirmRequest } from "./dialogs";
 import { Banner, Button, Checkbox, Chip, Glyph, Section, errorText, relativeTime, useKit } from "./ui";
 
@@ -61,6 +61,7 @@ export function WorkspaceCleanup() {
   const toast = useToast();
   const load = useRpc(workspacesRpc);
   const callArchive = useRpc(archiveWorkspacesRpc);
+  const callPushArchive = useRpc(pushArchiveWorkspacesRpc);
   const [open, setOpen] = useState(false);
   const [showBlocked, setShowBlocked] = useState(false);
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
@@ -85,9 +86,33 @@ export function WorkspaceCleanup() {
     onError: (error) => toast.error(errorText(error)),
   });
 
+  const pushArchive = useMutation({
+    mutationFn: callPushArchive,
+    onSuccess: ({ pushed, archived, skipped }) => {
+      const head = `已推送 ${pushed.length} 个分支，归档 ${archived.length} 个工作区`;
+      if (skipped.length > 0) {
+        const detail = skipped.map((item) => `${item.name}：${item.reason}`).join("\n");
+        toast.show(`${head}，${skipped.length} 个没有归档\n${detail}`, { variant: "warning" });
+      } else toast.show(head, { variant: "success" });
+      void data.refetch();
+    },
+    onError: (error) => toast.error(errorText(error)),
+  });
+
   const items = data.data?.workspaces ?? [];
   const ready = items.filter((item) => item.blockers.length === 0);
   const blocked = items.filter((item) => item.blockers.length > 0);
+  // Held back by nothing but a branch that exists only locally.
+  const pushable = blocked.filter((item) => item.pushTo);
+  const pushBranches = [...new Set(pushable.map((item) => `${item.branch} → ${item.pushTo}`))];
+  const askPushArchive = () =>
+    setConfirm({
+      title: `推送 ${pushBranches.length} 个分支并归档 ${pushable.length} 个工作区？`,
+      message: `这些工作区只因为提交还只在本地而留着。先把分支推到远端同名分支（不强推，远端有本地没有的提交就停下）：\n${pushBranches.join("\n")}\n推送成功后再按同样的检查归档，带 worktree 的目录可能删除，被忽略的文件不会保留。`,
+      confirmLabel: "推送并归档",
+      danger: pushable.some((item) => item.removesDirectory),
+      onConfirm: () => pushArchive.mutate({ ids: pushable.map((item) => item.id) }),
+    });
   const chosen = ready.filter((item) => selected.has(item.id));
   const allChosen = ready.length > 0 && chosen.length === ready.length;
   const toggle = (id: string) =>
@@ -156,6 +181,19 @@ export function WorkspaceCleanup() {
                 onPress={() => setSelected(allChosen ? new Set() : new Set(ready.map((item) => item.id)))}
               />
               <Button small variant="primary" icon="Archive" label={`归档选中（${chosen.length}）`} disabled={chosen.length === 0} loading={archive.isPending} onPress={askArchive} />
+            </View>
+          ) : null}
+          {pushable.length > 0 ? (
+            <View style={s.row}>
+              <Button
+                small
+                icon="Upload"
+                label={`推送并归档（${pushable.length}）`}
+                hint="把只在本地的分支推到远端，再归档这些工作区"
+                loading={pushArchive.isPending}
+                onPress={askPushArchive}
+              />
+              <Text style={s.muted}>{pushBranches.length} 个分支只在本地</Text>
             </View>
           ) : null}
           {blocked.length > 0 ? (

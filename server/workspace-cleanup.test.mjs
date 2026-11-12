@@ -7,7 +7,7 @@ import { after, before, test } from "node:test";
 import { assessWorkspace } from "./workspace-cleanup.ts";
 import { checkoutFacts } from "./workspace-project.ts";
 
-const checkout = (overrides = {}) => ({ branch: "feature", linkedWorktree: true, uncommitted: 0, tipElsewhere: "refs/heads/dev", ignored: [], ...overrides });
+const checkout = (overrides = {}) => ({ branch: "feature", linkedWorktree: true, uncommitted: 0, tipElsewhere: "refs/heads/dev", landed: "contains", pushTo: null, ignored: [], ...overrides });
 const facts = (overrides = {}) => ({
   id: "wks_1",
   kind: "directory",
@@ -26,7 +26,7 @@ const NONE = new Set();
 const blockers = (overrides, keep = NONE) => assessWorkspace(facts(overrides), keep).blockers;
 
 test("an unused plain directory can go and takes nothing with it", () => {
-  assert.deepEqual(assessWorkspace(facts(), NONE), { blockers: [], warnings: [], removesDirectory: false });
+  assert.deepEqual(assessWorkspace(facts(), NONE), { blockers: [], warnings: [], removesDirectory: false, pushTo: null });
 });
 
 test("anything in use is blocked", () => {
@@ -51,6 +51,14 @@ test("a directory workspace on a linked worktree is treated as a worktree", () =
 test("work that exists nowhere else blocks a worktree", () => {
   assert.deepEqual(blockers({ kind: "worktree", checkout: checkout({ uncommitted: 2 }) }), ["2 个文件未提交"]);
   assert.deepEqual(blockers({ kind: "worktree", checkout: checkout({ tipElsewhere: null }) }), ["分支 feature 的提交只在这个分支上"]);
+  // A push is offered only when it is all that stands in the way.
+  assert.equal(assessWorkspace(facts({ kind: "worktree", checkout: checkout({ tipElsewhere: null, pushTo: "origin" }) }), NONE).pushTo, "origin");
+  assert.equal(assessWorkspace(facts({ kind: "worktree", checkout: checkout({ tipElsewhere: null, pushTo: "origin", uncommitted: 1 }) }), NONE).pushTo, null);
+  assert.equal(assessWorkspace(facts({ kind: "worktree", checkout: checkout({ pushTo: "origin" }) }), NONE).pushTo, null);
+  assert.deepEqual(
+    assessWorkspace(facts({ kind: "worktree", checkout: checkout({ landed: "patch", tipElsewhere: "refs/heads/collect" }) }), NONE).warnings,
+    ["提交号不同，但改动已在 collect 里"],
+  );
 });
 
 test("not being able to read Git blocks a worktree rather than passing it", () => {
@@ -97,7 +105,15 @@ test("an unfinished ignored-file scan warns rather than passing silently", () =>
 });
 
 test("checkoutFacts reads a worktree whose tip is on another branch", async () => {
-  assert.deepEqual(await checkoutFacts(worktree), { branch: "feature", linkedWorktree: true, uncommitted: 0, tipElsewhere: "refs/heads/dev", ignored: [] });
+  assert.deepEqual(await checkoutFacts(worktree), {
+    branch: "feature",
+    linkedWorktree: true,
+    uncommitted: 0,
+    tipElsewhere: "refs/heads/dev",
+    landed: "contains",
+    pushTo: null,
+    ignored: [],
+  });
 });
 
 test("checkoutFacts sees the main checkout as not linked", async () => {

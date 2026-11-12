@@ -39,7 +39,7 @@ test("a symlink is never followed out of the directory", () => {
 });
 
 test("a branch name becomes one folder name", () => {
-  assert.equal(safeSegment("feat/video-tiered-pricing"), "feat__video-tiered-pricing");
+  assert.equal(safeSegment("feat/new-billing"), "feat__new-billing");
   assert.equal(safeSegment("..hidden"), "_hidden");
   assert.equal(safeSegment(""), "_");
 });

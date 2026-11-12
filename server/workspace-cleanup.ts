@@ -1,5 +1,7 @@
 import type { CheckoutFacts } from "./workspace-project";
 
+const shortRef = (ref: string) => ref.replace(/^refs\/(heads|remotes)\//, "");
+
 export interface WorkspaceFacts {
   id: string;
   /** Paseo's workspaceKind. */
@@ -27,6 +29,11 @@ export interface WorkspaceAssessment {
   warnings: string[];
   /** Archiving may delete this directory. */
   removesDirectory: boolean;
+  /**
+   * Set when the only blocker is a branch whose commits exist nowhere else, and pushing it to this remote would clear
+   * it. Only an offer: the page pushes when the user asks, since a push is seen by everyone on the remote.
+   */
+  pushTo: string | null;
 }
 
 /**
@@ -37,6 +44,7 @@ export interface WorkspaceAssessment {
 export function assessWorkspace(facts: WorkspaceFacts, keep: ReadonlySet<string>): WorkspaceAssessment {
   const blockers: string[] = [];
   const warnings: string[] = [];
+  let pushTo: string | null = null;
   const { checkout } = facts;
   const branch = checkout?.branch ?? null;
   const removesDirectory = facts.kind === "worktree" || !!facts.worktreeSlug || !!checkout?.linkedWorktree;
@@ -58,7 +66,12 @@ export function assessWorkspace(facts: WorkspaceFacts, keep: ReadonlySet<string>
     if (facts.checkoutError) blockers.push(`读不到 Git 状态：${facts.checkoutError}`);
     else if (checkout) {
       if (checkout.uncommitted > 0) blockers.push(`${checkout.uncommitted} 个文件未提交`);
-      if (!checkout.tipElsewhere) blockers.push(branch ? `分支 ${branch} 的提交只在这个分支上` : "当前提交没有其他分支包含");
+      if (!checkout.tipElsewhere) {
+        blockers.push(branch ? `分支 ${branch} 的提交只在这个分支上` : "当前提交没有其他分支包含");
+        if (branch && checkout.pushTo) pushTo = checkout.pushTo;
+      } else if (checkout.landed === "patch" || checkout.landed === "content") {
+        warnings.push(`提交号不同，但改动已在 ${shortRef(checkout.tipElsewhere)} 里${checkout.landed === "content" ? "（文件内容一致）" : ""}`);
+      }
       if (checkout.ignored === null) warnings.push("没查完被忽略的文件（如 .env），它们可能一起删除");
       else if (checkout.ignored.length > 0) {
         const shown = checkout.ignored.slice(0, 3).join("、");
@@ -66,5 +79,5 @@ export function assessWorkspace(facts: WorkspaceFacts, keep: ReadonlySet<string>
       }
     }
   }
-  return { blockers, warnings, removesDirectory };
+  return { blockers, warnings, removesDirectory, pushTo: blockers.length === 1 ? pushTo : null };
 }

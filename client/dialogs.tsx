@@ -98,6 +98,8 @@ export interface ConfirmRequest {
   confirmLabel: string;
   danger?: boolean;
   onConfirm: () => void;
+  /** A second way out, shown between 取消 and the main button. */
+  alternative?: { label: string; danger?: boolean; onPress: () => void };
 }
 
 export function ConfirmDialog({ request, onClose }: { request: ConfirmRequest | null; onClose: () => void }) {
@@ -107,6 +109,17 @@ export function ConfirmDialog({ request, onClose }: { request: ConfirmRequest | 
       <Text style={[s.text, { lineHeight: 22 }]}>{request?.message}</Text>
       <View style={[s.row, { justifyContent: "flex-end" }]}>
         <Button label="取消" variant="ghost" onPress={onClose} />
+        {request?.alternative ? (
+          <Button
+            label={request.alternative.label}
+            variant={request.alternative.danger ? "danger" : "secondary"}
+            onPress={() => {
+              const action = request.alternative?.onPress;
+              onClose();
+              action?.();
+            }}
+          />
+        ) : null}
         <Button
           label={request?.confirmLabel ?? "确定"}
           variant={request?.danger ? "danger" : "primary"}

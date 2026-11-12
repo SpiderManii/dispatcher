@@ -51,6 +51,10 @@ const ledgerView = z.object({
   exists: z.boolean(),
   updatedAt: z.string().nullable(),
   pendingDecisions: z.number(),
+  /** Open `- [ ]` items under 待用户拍板. */
+  decisions: z.array(z.object({ line: z.string(), text: z.string(), hasRecommendation: z.boolean() })),
+  /** Plain items there, with no checkbox: not counted, shown so nothing open hides behind the old format. */
+  unmarkedDecisions: z.number(),
 });
 
 export const laneProjectView = z.object({
@@ -58,6 +62,8 @@ export const laneProjectView = z.object({
   name: z.string(),
   path: z.string(),
   branch: z.string().optional(),
+  /** 收口分支: where the lane's work ends up. */
+  landing: z.string().optional(),
 });
 export type LaneProjectView = z.infer<typeof laneProjectView>;
 
@@ -89,6 +95,8 @@ export const dispatcherView = z.object({
   agentsPath: z.string(),
   boardPath: z.string(),
   lastError: z.string().nullable(),
+  /** Workspace IDs in `lastError` that a push would let go; the banner offers 「推送并归档」. */
+  pushableKept: z.array(z.string()),
   history: z.array(historyEntry),
 });
 export type DispatcherView = z.infer<typeof dispatcherView>;
@@ -113,6 +121,8 @@ const overviewOutput = z.object({
   dispatchers: z.array(dispatcherView),
   handoffs: z.array(handoffFile),
   checkedAt: z.string(),
+  /** The worker watch that wakes dispatchers in place of heartbeats. */
+  watch: z.object({ startedAt: z.string().nullable(), lastScanAt: z.string().nullable(), error: z.string().nullable() }),
 });
 export type Overview = z.infer<typeof overviewOutput>;
 
@@ -247,6 +257,19 @@ export const saveAgentsRpc = defineRpc({
     ),
   }),
   output: z.object({ ok: z.literal(true) }),
+});
+
+/** Answers open decisions from the page: ticks them in the ledger, then tells the lane's dispatcher once it is idle. */
+export const answerDecisionsRpc = defineRpc({
+  name: "dispatch.answer-decisions",
+  input: z.object({
+    dispatcherId: z.string().min(1),
+    laneId: z.string().min(1),
+    /** Ledger lines exactly as the page showed them. */
+    lines: z.array(z.string().min(1)).min(1),
+    answer: z.string().trim().min(1).max(4000),
+  }),
+  output: z.object({ queued: z.boolean() }),
 });
 
 export const startRpc = defineRpc({
@@ -412,6 +435,8 @@ export const workspaceItem = z.object({
   blockers: z.array(z.string()),
   warnings: z.array(z.string()),
   removesDirectory: z.boolean(),
+  /** The remote a push would save the branch to, when its commits exist nowhere else. */
+  pushTo: z.string().nullable(),
 });
 export type WorkspaceItem = z.infer<typeof workspaceItem>;
 
@@ -432,6 +457,24 @@ export const archiveWorkspacesRpc = defineRpc({
   }),
 });
 
+/** Drops archived dispatcher sessions from the page. Paseo keeps them archived; entries still needed stay. */
+export const clearArchivedRpc = defineRpc({
+  name: "dispatch.clear-archived",
+  input: z.object({}),
+  output: z.object({ cleared: z.number(), workersLeft: z.number(), laneOpen: z.number() }),
+});
+
+/** Pushes each branch whose commits exist only locally, never forced, then archives under the same re-checks. */
+export const pushArchiveWorkspacesRpc = defineRpc({
+  name: "dispatch.push-archive-workspaces",
+  input: z.object({ ids: z.array(z.string().min(1)).min(1), dispatcherId: z.string().min(1).optional() }),
+  output: z.object({
+    pushed: z.array(z.string()),
+    archived: z.array(z.string()),
+    skipped: z.array(z.object({ id: z.string(), name: z.string(), reason: z.string() })),
+  }),
+});
+
 const cascadeResult = z.object({
   archived: z.number(),
   running: z.number(),
@@ -445,8 +488,25 @@ export type CascadeResult = z.infer<typeof cascadeResult>;
 /** Archives a lane's session and the workers it started, and frees its seat. The ledger stays. */
 export const archiveLaneRpc = defineRpc({
   name: "dispatch.archive-lane",
-  input: z.object({ dispatcherId: z.string().min(1), laneId: z.string().min(1) }),
+  /** `force` archives although some branch is not merged into the landing branch yet. */
+  input: z.object({ dispatcherId: z.string().min(1), laneId: z.string().min(1), force: z.boolean().optional() }),
   output: cascadeResult,
+});
+
+const unlandedBranch = z.object({ project: z.string(), branch: z.string(), landing: z.string() });
+
+/** The lane's landing branches, and the branches its workers left that are not merged into them yet. Read-only. */
+export const laneLandingRpc = defineRpc({
+  name: "dispatch.lane-landing",
+  input: z.object({ dispatcherId: z.string().min(1), laneId: z.string().min(1) }),
+  output: z.object({ landings: z.array(z.object({ project: z.string(), landing: z.string() })), unlanded: z.array(unlandedBranch) }),
+});
+
+/** Tells the lane's dispatcher to merge those branches back, with the user's go-ahead. */
+export const landLaneRpc = defineRpc({
+  name: "dispatch.land-lane",
+  input: z.object({ dispatcherId: z.string().min(1), laneId: z.string().min(1) }),
+  output: z.object({ sent: z.boolean(), unlanded: z.array(unlandedBranch) }),
 });
 
 /** Workers and their workspaces whose dispatcher was archived. Running ones are left to finish. */

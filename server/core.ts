@@ -62,6 +62,11 @@ export const registrySchema = z.object({
       claudeAgents: z.number().int().min(0).optional(),
     })
     .optional(),
+  /**
+   * Quota endpoint returning per-provider usage windows. dispatch_work skips a candidate whose family is used up and warns when it is low.
+   * Without it, quota isn't prechecked.
+   */
+  quotaUrl: z.string().url().optional(),
   /** Workspace IDs and branch names the cleanup list must never offer: a branch in progress can look finished. */
   keep: z.array(z.string().min(1)).optional(),
   /** Who does what: each role's candidates, in the order dispatch_work tries them. Defaults come from §3. */
@@ -139,6 +144,11 @@ const laneProjectSchema = z.object({
   path: z.string(),
   /** Only known when the user picked one on the page. */
   branch: z.string().optional(),
+  /**
+   * 收口分支: where every branch the lane opens is merged back before it ends. The branch picked on the page, else the
+   * one the project directory was on when the lane first took it.
+   */
+  landing: z.string().optional(),
 });
 export type LaneProject = z.infer<typeof laneProjectSchema>;
 /**
@@ -162,6 +172,8 @@ const dispatcherStateSchema = z.object({
   workspaceId: z.string().nullable(),
   lanes: z.array(laneSchema).default([]),
   lastError: z.string().nullable(),
+  /** Workspaces the last cascade left behind only because their branch was never pushed; the page offers to push them. */
+  pushableKept: z.array(z.string()).default([]),
   history: z.array(historySchema),
   // Single-seat fields from before lanes existed; migrated into a lane by loadState.
   currentAgentId: z.string().nullable().optional(),
@@ -402,7 +414,7 @@ export function renderAgentsFile(input: {
     "- 每条会话线有自己的台账，只管首条消息和后续指派交给它的项目与需求；别的线的需求不接、不碰它们派出的执行会话。",
     "- 同一项目有另一条线时，派单前读看板和对方台账的「改动范围」，按 §1.1、§5 确认互不影响；有交叉或拿不准就停手，回报用户。",
     "- 本线的「改动范围」（文件或模块、分支、worktree）在首次派单前写进台账，范围变了立即更新。",
-    "- §1.4 的并行上限是全部会话线合计：派单前用 `paseo ls` 数全部在跑的子 agent，到上限就排队。",
+    "- §1.4 的并行上限是全部会话线合计，只数调度员派出的（`paseo ls -g --label dispatch-center/dispatcher=<调度员ID>` 里在跑的）；`dispatch_work` 到上限会拒绝，到上限就排队。",
     "",
     "## 开工与恢复（新会话、上下文压缩后都要做）",
     "",
@@ -413,11 +425,11 @@ export function renderAgentsFile(input: {
     "## 会话边界（以本节为准）",
     "",
     "- 只跟进、send、归档本线台账里登记的、由本线（含前任）派出的执行会话。`paseo ls` 里的其他会话（用户自己开的、其他会话线或调度员的、来历不明的）一律不 send、不归档、不接管、不写进本线台账；看起来相关时，列出会话 ID 回报用户确认。",
-    "- 派单必须用 `--cwd` 指向目标项目的仓库或 worktree，禁止在本调度目录里开执行会话，也不要在这里另开调度员会话；要多一条会话线，由用户在调度员页面开。",
+    "- 派单的 cwd（`dispatch_work` 的 cwd 字段，手动派时的 `--cwd`）必须指向目标项目的仓库或 worktree，禁止在本调度目录里开执行会话，也不要在这里另开调度员会话；要多一条会话线，由用户在调度员页面开。",
     "",
     "## 台账",
     "",
-    "每次派单、核验完成、遇到阻塞后立即更新本线台账：执行会话 ID、项目、cwd、分支、状态文件、阶段、下一步、待拍板，以及改动范围。执行会话核验完就从「在跑」表移到「最近完成」。不要等到换班才整理。不要写别的线的台账。",
+    "核验完成、遇到阻塞后立即更新本线台账：阶段、下一步和改动范围。`dispatch_work` 派出的执行会话，插件已把会话 ID、工作区、项目、cwd、分支、状态文件写进「在跑执行会话」表，不要再写一遍；手动派的自己写。需要用户定的事按 `- [ ] 问题（推荐：…）` 写进「待用户拍板」，尽量给推荐：10 分钟没答复插件会按推荐自动答复，没推荐就让你问架构师。执行会话核验完就从「在跑」表移到「最近完成」。不要等到换班才整理。不要写别的线的台账。",
     "",
     "## 手动接班",
     "",
@@ -427,9 +439,9 @@ export function renderAgentsFile(input: {
     "",
     "- 你的核心工作：看用户这句话属于哪个角色的强项，就派给它；跨多个强项就拆开分别派。不亲自做，也不把拿不准的活都归给测试。",
     "- 派执行会话用 `dispatch_work` 工具。你只判断活归哪个角色并写一句理由，再交齐任务卡字段；模型、模式、thinking、并行上限、建工作区由插件完成。第 3 节的具体模型以工具返回为准，分工表在调度员页面查看。",
-    "- 额度仍按第 4 节查，不够或撞限流的家写进 `avoid`，工具会换下一个备选。",
+    "- 额度由插件查（第 4 节）：用完的家自动跳过，剩余不足 30% 时结果会提醒不接长活。实际撞了限流的家写进 `avoid`，工具会换下一个备选。",
     "- 工具拒绝（到并行上限、任务卡不合格、备选都不可用）时不绕过：排队或上报。只有会话里没有这个工具时，才按第 5 节用 `paseo run`，并在回报里说明。",
-    "- 派出后仍按第 6 节建心跳，并更新本线台账。",
+    "- 派出后结束本轮，等插件的执行会话状态通知（第 6 节）；不建心跳，台账「在跑」表的行插件已写好。",
     "",
     "## 页面指派（以本节为准）",
     "",
@@ -477,9 +489,51 @@ export function renderLedger(
     "",
     "## 待用户拍板",
     "",
+    "<!-- 一条一行：`- [ ] 问题（推荐：…）` 。在页面上答复后插件改成 `- [x] … → 用户：…`；拍完的挪进决策记录或「最近完成」。 -->",
+    "",
     "## 最近完成",
     "",
   ].join("\n");
+}
+
+const RUNNING_HEADING = "## 在跑执行会话";
+const RUNNING_HEADER = "| 会话 ID | 项目 | cwd | 分支 | 状态文件 | 阶段 | 下一步 |";
+
+/**
+ * Adds a dispatched worker to the lane ledger's 在跑执行会话 table. Written by the plugin at dispatch time, so the
+ * row exists even when the dispatcher's turn is cut off before it sees the tool result. Returns the new text, or
+ * null when the session is already listed.
+ */
+export function withRunningRow(
+  ledger: string,
+  row: { agentId: string; workspaceId: string; project: string; cwd: string; branch: string; statusFile: string },
+): string | null {
+  if (ledger.includes(row.agentId)) return null;
+  const line = `| ${[
+    `${row.agentId}（工作区 ${row.workspaceId}）`,
+    row.project,
+    row.cwd,
+    row.branch,
+    row.statusFile,
+    "已派出（插件记录）",
+    "等状态文件，待验收后核验",
+  ]
+    .map(cell)
+    .join(" | ")} |`;
+  const lines = ledger.split("\n");
+  const heading = lines.findIndex((item) => item.trim() === RUNNING_HEADING);
+  if (heading < 0) return `${ledger.trimEnd()}\n\n${RUNNING_HEADING}\n\n${RUNNING_HEADER}\n|---|---|---|---|---|---|---|\n${line}\n`;
+  const next = lines.findIndex((item, index) => index > heading && item.startsWith("## "));
+  const end = next < 0 ? lines.length : next;
+  const separator = lines.findIndex((item, index) => index > heading && index < end && /^\|\s*-{3}/.test(item.trim()));
+  if (separator < 0) {
+    lines.splice(heading + 1, 0, "", RUNNING_HEADER, "|---|---|---|---|---|---|---|", line);
+    return lines.join("\n");
+  }
+  let last = separator;
+  while (last + 1 < end && lines[last + 1].trim().startsWith("|")) last += 1;
+  lines.splice(last + 1, 0, line);
+  return lines.join("\n");
 }
 
 export interface SyncResult {
@@ -537,6 +591,7 @@ export function emptyDispatcherState(): DispatcherState {
     workspaceId: null,
     lanes: [],
     lastError: null,
+    pushableKept: [],
     history: [],
   };
 }
@@ -1205,22 +1260,63 @@ export function listDirectory(input: string, showHidden = false, limit = 500) {
 const NOTHING_PENDING = /^(?:无|暂无|没有|none)(?=$|[\s（(，,。.:：;；])/i;
 
 /** One per decision: bullets nested under a decision are its details, so only the outermost level counts. */
-export function summarizeLedger(text: string): { pendingDecisions: number } {
+export interface OpenDecision {
+  /** The ledger line exactly as written; answering finds the item by it, so a ledger edited meanwhile is caught. */
+  line: string;
+  text: string;
+  /** Whether the item names a recommendation, so 「按推荐」 means something. */
+  hasRecommendation: boolean;
+}
+
+const DECISION_ITEM = /^(\s*)(?:[-*]|\d+\.)\s+(\S.*)$/;
+const CHECKBOX = /^\[( |x|X)\]\s*(.*)$/;
+
+/**
+ * The 待用户拍板 section. Only `- [ ]` items are open; `- [x]` are decided. Plain items are counted apart as
+ * 「未标状态」: older ledgers list what was already decided that way, which kept a stale count on the page.
+ */
+export function summarizeLedger(text: string): { pendingDecisions: number; decisions: OpenDecision[]; unmarkedDecisions: number } {
   let inDecisions = false;
-  const items: { indent: number; text: string }[] = [];
+  const items: { indent: number; line: string; text: string }[] = [];
   for (const line of text.split(/\r?\n/)) {
     const heading = /^##\s+(.+?)\s*$/.exec(line);
     if (heading) {
       inDecisions = heading[1].includes("拍板");
       continue;
     }
-    const item = /^(\s*)(?:[-*]|\d+\.)\s+(\S.*)$/.exec(line);
-    if (inDecisions && item) items.push({ indent: item[1].length, text: item[2] });
+    const item = DECISION_ITEM.exec(line);
+    if (inDecisions && item) items.push({ indent: item[1].length, line, text: item[2] });
   }
   const outermost = Math.min(...items.map((item) => item.indent));
-  return {
-    pendingDecisions: items.filter((item) => item.indent === outermost && !NOTHING_PENDING.test(item.text)).length,
-  };
+  const decisions: OpenDecision[] = [];
+  let unmarked = 0;
+  for (const item of items) {
+    if (item.indent !== outermost) continue;
+    const box = CHECKBOX.exec(item.text);
+    if (!box) {
+      if (!NOTHING_PENDING.test(item.text)) unmarked += 1;
+      continue;
+    }
+    if (box[1] !== " ") continue;
+    decisions.push({ line: item.line, text: box[2], hasRecommendation: box[2].includes("推荐") });
+  }
+  return { pendingDecisions: decisions.length, decisions, unmarkedDecisions: unmarked };
+}
+
+/**
+ * Ticks answered items in the ledger and writes the answer beside each, so the page count drops at once and the
+ * ledger keeps the record. Throws when an item is no longer there as shown: the dispatcher changed it meanwhile.
+ */
+export function markDecisions(ledger: string, lines: string[], answer: string, now: Date, who = "用户"): string {
+  const all = ledger.split("\n");
+  const stamp = `${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+  const reply = answer.replace(/\s+/g, " ").trim();
+  for (const line of lines) {
+    const index = all.findIndex((item) => item.replace(/\r$/, "") === line);
+    if (index < 0) throw new Error("台账里这条已经变了，刷新后再答");
+    all[index] = `${line.replace(/\[ \]/, "[x]")} → ${who}：${reply}（${stamp}）`;
+  }
+  return all.join("\n");
 }
 
 export function ledgerInfo(file: string) {
@@ -1233,7 +1329,7 @@ export function ledgerInfo(file: string) {
       ...summarizeLedger(readFileSync(file, "utf8")),
     };
   } catch {
-    return { path: file, exists: false, updatedAt: null, pendingDecisions: 0 };
+    return { path: file, exists: false, updatedAt: null, pendingDecisions: 0, decisions: [], unmarkedDecisions: 0 };
   }
 }
 

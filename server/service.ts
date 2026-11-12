@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -13,9 +14,11 @@ import type {
   WorkspaceItem,
 } from "../shared/contracts";
 import { statusFileProblem } from "./container-paths";
+import { parseQuotas, quotaState, type QuotaEntry } from "./quota";
 import {
   SCAN_MS,
   emptyWatch,
+  queueReply,
   recordDispatched,
   recordTurnEnd,
   scanWorkers,
@@ -81,8 +84,12 @@ import {
   type Lane,
   type LaneProject,
   type Registry,
+  type DispatcherState,
   type State,
+  markDecisions,
+  summarizeLedger,
   updateRegistry,
+  withRunningRow,
 } from "./core";
 import {
   autoConfig,
@@ -90,6 +97,7 @@ import {
   pickCandidate,
   renderRoleGuide,
   renderWorkPrompt,
+  cardFeedback,
   resolveCandidate,
   rolesOf,
   type Profile,
@@ -97,11 +105,31 @@ import {
   type WorkCard,
 } from "./roles";
 
-import { checkoutFacts, type CheckoutFacts, directoryWorkspaceSource, listBranches, resolveBranchChoice, type ResolvedBranch } from "./workspace-project";
+import {
+  branchLandsOn,
+  checkoutFacts,
+  type CheckoutFacts,
+  currentBranch,
+  directoryWorkspaceSource,
+  headCommit,
+  listBranches,
+  pushCheckoutBranch,
+  resolveBranchChoice,
+  type ResolvedBranch,
+  sameRepository,
+} from "./workspace-project";
 import { decideApproval } from "./auto-approve";
 import { CLEANUP_CHECK_MS, cleanupDue, parseCleanupRecord, type CleanupRecord } from "./auto-cleanup";
 import { backupEnvFiles, envFilesOf, safeSegment } from "./env-backup";
 import { assessWorkspace } from "./workspace-cleanup";
+import {
+  architectReply,
+  DECISION_CHECK_MS,
+  type DecisionClock,
+  dueDecisions,
+  pruneClock,
+  recommendReply,
+} from "./decision-timeout";
 
 type PaseoApi = PluginHandlerContext["paseo"];
 
@@ -268,6 +296,28 @@ export async function providerCatalogView(paseo: PaseoApi, input: { refresh?: bo
   }
 }
 
+const QUOTA_TTL_MS = 5 * 60_000;
+let quotaCache: { url: string; at: number; entries: QuotaEntry[] } | null = null;
+
+/** Null when no endpoint is set or it can't be read: then nothing is prechecked, as §4 says. */
+async function loadQuotas(url: string | undefined): Promise<QuotaEntry[] | null> {
+  if (!url) return null;
+  if (quotaCache && quotaCache.url === url && Date.now() - quotaCache.at < QUOTA_TTL_MS) return quotaCache.entries;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3_000);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) return null;
+    const entries = parseQuotas(await response.json());
+    quotaCache = { url, at: Date.now(), entries };
+    return entries;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** Whether this dispatcher launches on Antigravity, whose single-file limit the AGENTS.md size warning is about. */
 function usesAntigravity(registry: Registry, dispatcher: DispatcherDef): boolean {
   if (dispatcher.provider) return dispatcher.provider.split("/")[0].toLowerCase() === "antigravity";
@@ -391,6 +441,34 @@ function laneIntro(lane: { id: string; ledgerPath: string }, dispatcherId: strin
   return `你是会话线 ${lane.id}。本线台账 ${lane.ledgerPath}，会话线看板 ${layout.laneIndexPath(dispatcherId)}。`;
 }
 
+/**
+ * The lane ends on the branch it started from. `launchLane` tells every new agent on the lane (start, relaunch,
+ * successor) and `assign` tells a running one when it changes, so no lane closes with
+ * its work spread over temporary branches and worktrees. Archiving the lane from the page checks it.
+ */
+function landingNote(projects: readonly LaneProject[]): string {
+  const held = projects.filter((project) => landingOf(project));
+  if (held.length === 0) return "";
+  const list = held.map((project) => `「${project.name}」→ ${landingOf(project)}`).join("，");
+  return `收口分支：${list}。本线开的临时分支、集成分支，验收后都合回收口分支（合回前仍按第 13 节请用户点头，有冲突停下报告），合回后先撤 worktree 再删本地分支；本线收尾时这些项目只剩收口分支。任务卡的预期分支可以是临时分支，但交付终点是收口分支。`;
+}
+
+/** Lanes from before landing branches were recorded fall back to the branch picked on the page. */
+function landingOf(project: LaneProject): string | undefined {
+  return project.landing ?? project.branch;
+}
+
+/** The landing branch for projects that don't have one yet: the picked branch, else what the directory is on. */
+async function withLanding(projects: LaneProject[]): Promise<LaneProject[]> {
+  return Promise.all(
+    projects.map(async (project) => {
+      if (project.landing) return project;
+      const landing = project.branch ?? (await currentBranch(project.path).catch(() => null));
+      return landing ? { ...project, landing } : project;
+    }),
+  );
+}
+
 /** Paseo takes only the bytes and the type; the name stays in the saved file's path. */
 function paseoImages(images: PromptImage[]) {
   return images.map(({ data, mimeType }) => ({ data, mimeType }));
@@ -422,7 +500,7 @@ async function launchLane(
     const agent = await workspace.agents.create({
       config,
       title,
-      prompt,
+      prompt: [prompt, landingNote(spec.projects)].filter(Boolean).join("\n\n"),
       ...(images.length > 0 ? { images: paseoImages(images) } : {}),
       labels: { [LABEL_ROLE]: "dispatcher", [LABEL_DISPATCHER]: dispatcher.id, "dispatch-center/lane": spec.id },
     });
@@ -571,6 +649,7 @@ export function overview(paseo: PaseoApi): Promise<Overview> {
       registryPath: layout.registryPath,
       handoffs: listHandoffs(layout),
       checkedAt: new Date().toISOString(),
+      watch: watchHealth(),
     };
     if (!registry)
       return {
@@ -631,6 +710,7 @@ export function overview(paseo: PaseoApi): Promise<Overview> {
           agentsPath: path.join(layout.dispatcherDir(dispatcher.id), "AGENTS.md"),
           boardPath: layout.laneIndexPath(dispatcher.id),
           lastError: entry.lastError,
+          pushableKept: entry.lastError ? entry.pushableKept : [],
           history,
         };
       }),
@@ -762,7 +842,7 @@ export function assign(
       const choice = input.branches?.[target.path];
       if (choice) branches.set(target.path, await resolveBranchChoice(target.path, choice));
     }
-    const held = heldTargets.map((target) => laneProject(target, branches.get(target.path)?.name));
+    const held = await withLanding(heldTargets.map((target) => laneProject(target, branches.get(target.path)?.name)));
 
     const state = loadState(layout);
     await settleArchivedLanes(paseo, registry, state);
@@ -787,10 +867,13 @@ export function assign(
       const added = held.filter((project) => !lane.projects.some((item) => item.key === project.key));
       const titleBefore = laneTitle(lane);
       lane.projects.push(...added);
+      const landingBefore = landingNote(lane.projects);
       for (const project of held) {
         const item = lane.projects.find((existing) => existing.key === project.key);
-        if (item && project.branch) item.branch = project.branch;
+        if (item && project.branch) item.branch = item.landing = project.branch;
+        else if (item) item.landing ??= project.landing;
       }
+      const landingNow = landingNote(lane.projects);
       lane.summary ??= summarize(input.task);
       if (laneTitle(lane) !== titleBefore) await retitleLane(paseo, lane);
       const body = assignmentPrompt({
@@ -802,7 +885,12 @@ export function assign(
         branches,
       });
       const notice = sharedNotice(route.shared);
-      const extra = added.length > 0 ? `本线新增项目：${added.map((project) => project.name).join("、")}，请同步到台账。` : "";
+      const extra = [
+        added.length > 0 ? `本线新增项目：${added.map((project) => project.name).join("、")}，请同步到台账。` : "",
+        landingNow !== landingBefore ? landingNow : "",
+      ]
+        .filter(Boolean)
+        .join("\n");
       const attached = imagesNote(saveImages(layout, dispatcher.id, lane.id, images));
       const prompt = [body, extra, notice, attached].filter(Boolean).join("\n\n");
       if (status === "idle" || status === "closed") {
@@ -976,10 +1064,52 @@ function logWatch(line: string): void {
 function loadWatch(): WatchState {
   try {
     const parsed = JSON.parse(readFileSync(path.join(watchDir(), "worker-watch.json"), "utf8"));
-    return { workers: parsed.workers ?? {}, notices: parsed.notices ?? [], endings: parsed.endings ?? {} };
+    return {
+      workers: parsed.workers ?? {},
+      notices: parsed.notices ?? [],
+      endings: parsed.endings ?? {},
+      known: parsed.known ?? {},
+    };
   } catch {
     return emptyWatch();
   }
+}
+
+const DELIVERY_TIMEOUT_MS = 40_000;
+const DELIVERY_POLL_MS = 1_500;
+
+/**
+ * Sends and waits until the dispatcher has actually started a turn on it. Paseo's send resolves before the turn
+ * starts, and when the provider still holds the previous turn the start fails in the background (Paseo retries for
+ * about half a minute, then gives up). Throwing here keeps the notice queued for the next scan.
+ */
+async function sendConfirmed(paseo: PaseoApi, agentId: string, text: string, messageId: string): Promise<void> {
+  const ref = paseo.agents.ref(agentId);
+  const sentAt = Date.now();
+  await ref.send(text, { messageId });
+  let lastError: string | null = null;
+  while (Date.now() - sentAt < DELIVERY_TIMEOUT_MS) {
+    await new Promise((resolve) => setTimeout(resolve, DELIVERY_POLL_MS));
+    const agent = (await ref.refresh().catch(() => null))?.agent;
+    if (!agent) continue;
+    if (agent.activeTurn || BUSY.has(agent.status)) return;
+    lastError = agent.lastError ?? lastError;
+    // A turn short enough to start and finish between two polls is caught by its replies.
+    if (await answeredInTimeline(paseo, agentId, messageId).catch(() => false)) return;
+  }
+  throw new Error(`调度员没开始处理这条通知${lastError ? `（${lastError}）` : ""}`);
+}
+
+/**
+ * Whether the message opened a turn that produced anything: reasoning, a tool call or a reply. Paseo's own
+ * "[System Error]" lines carry no turn, so a message that only drew errors counts as not answered.
+ */
+async function answeredInTimeline(paseo: PaseoApi, agentId: string, messageId: string): Promise<boolean> {
+  const page = await paseo.agents.ref(agentId).timeline.refetch({ direction: "tail", limit: 200 });
+  const entries = page.entries ?? [];
+  const message = entries.find((entry) => entry.item.type === "user_message" && entry.item.messageId === messageId);
+  if (!message?.turnId) return false;
+  return entries.some((entry) => entry.turnId === message.turnId && entry.item.type !== "user_message");
 }
 
 function watchIo(paseo: PaseoApi): WatchIo {
@@ -1007,8 +1137,30 @@ function watchIo(paseo: PaseoApi): WatchIo {
       return existsSync(resolved) ? readFileSync(resolved, "utf8") : null;
     },
     dispatcherStatus: (agentId) => agentStatus(paseo, agentId),
-    send: async (agentId, text) => {
-      await paseo.agents.ref(agentId).send(text);
+    send: (agentId, text, messageId) => sendConfirmed(paseo, agentId, text, messageId),
+    turnOpener: async (workerId) => {
+      const page = await paseo.agents.ref(workerId).timeline.refetch({ direction: "tail", limit: 200 });
+      const opener = [...(page.entries ?? [])].reverse().find((entry) => entry.item.type === "user_message")?.item;
+      if (!opener || opener.type !== "user_message") return null;
+      // Paseo wraps a message one session sends another; what someone types arrives as plain text.
+      return /^\s*<paseo-system\b[^>]*\bkind="agent-message"/.test(opener.text) ? "agent" : "user";
+    },
+    lastReply: async (workerId) => {
+      const page = await paseo.agents.ref(workerId).timeline.refetch({ direction: "tail", limit: 30 });
+      const replies = (page.entries ?? []).filter(
+        (entry) => entry.item.type === "assistant_message" && !entry.item.text.startsWith("[System Error]"),
+      );
+      const last = replies[replies.length - 1]?.item;
+      return last && last.type === "assistant_message" ? last.text : null;
+    },
+    answered: (agentId, messageId) => answeredInTimeline(paseo, agentId, messageId),
+    newMessageId: () => randomUUID(),
+    replyHandled: async (laneAgentId, detail) => {
+      const found = laneByAgent(loadState(layout), laneAgentId);
+      if (!found || !existsSync(found.lane.ledgerPath)) return false;
+      const ledger = readFileSync(found.lane.ledgerPath, "utf8").split("\n").filter((line) => /\[x\]/i.test(line));
+      const items = detail.split("\n").filter((line) => line.startsWith("- ")).map((line) => line.slice(2).trim());
+      return items.length > 0 && items.every((item) => !ledger.some((line) => line.includes(item)));
     },
     log: logWatch,
     now: () => Date.now(),
@@ -1020,6 +1172,19 @@ let watchPaseo: PaseoApi | null = null;
 let watchTimer: ReturnType<typeof setInterval> | null = null;
 let watchChain: Promise<unknown> = Promise.resolve();
 let lastWatchError: string | null = null;
+let watchStartedAt: number | null = null;
+let lastScanAt: number | null = null;
+
+/** For the page: the watch replaces heartbeats, so a stalled watch must be visible. */
+export function watchHealth(): { startedAt: string | null; lastScanAt: string | null; error: string | null } {
+  const iso = (at: number | null) => (at === null ? null : new Date(at).toISOString());
+  return { startedAt: iso(watchStartedAt), lastScanAt: iso(lastScanAt), error: lastWatchError };
+}
+
+async function scanAndMark(state: WatchState, io: WatchIo): Promise<void> {
+  await scanWorkers(state, io);
+  lastScanAt = Date.now();
+}
 
 function runWatch(work: (state: WatchState, io: WatchIo) => Promise<void>): Promise<void> {
   const next = watchChain.then(async () => {
@@ -1081,13 +1246,66 @@ async function autoCleanup(): Promise<void> {
   }
 }
 
+let decisionTimer: ReturnType<typeof setInterval> | null = null;
+const decisionClockFile = () => path.join(watchDir(), "decision-clock.json");
+
+/**
+ * The user's 10-minute rule for 待用户拍板: an item left unanswered gets its recommendation, or the dispatcher is told
+ * to ask the architect. The clock is on disk, so a reload neither restarts nor skips anyone's 10 minutes. Items rule 1.3
+ * reserves for the user are left alone.
+ */
+async function timeOutDecisions(): Promise<void> {
+  if (!watchPaseo || !existsSync(layout.statePath)) return;
+  const replies = await exclusive(async () => {
+    let clock: DecisionClock = {};
+    try {
+      clock = JSON.parse(readFileSync(decisionClockFile(), "utf8"));
+    } catch {
+      // First run: every open item starts its 10 minutes now.
+    }
+    const before = JSON.stringify(clock);
+    const now = Date.now();
+    const open = new Map<string, ReturnType<typeof summarizeLedger>["decisions"]>();
+    const out: { laneAgentId: string; text: string }[] = [];
+    for (const { lane } of allLanes(loadState(layout))) {
+      if (lane.pendingHandoff || !existsSync(lane.ledgerPath)) continue;
+      const ledger = readFileSync(lane.ledgerPath, "utf8");
+      const { decisions } = summarizeLedger(ledger);
+      open.set(lane.id, decisions);
+      const due = dueDecisions(clock, lane.id, decisions, now);
+      if (due.recommend.length > 0) {
+        writeAtomic(lane.ledgerPath, markDecisions(ledger, due.recommend.map((item) => item.line), "按推荐（10 分钟未答）", new Date(now), "自动"));
+        out.push({ laneAgentId: lane.agentId, text: recommendReply(due.recommend) });
+        logWatch(`会话线 ${lane.id} 有 ${due.recommend.length} 条待拍板 10 分钟未答，已按推荐答复`);
+      }
+      if (due.architect.length > 0) {
+        out.push({ laneAgentId: lane.agentId, text: architectReply(due.architect) });
+        logWatch(`会话线 ${lane.id} 有 ${due.architect.length} 条待拍板 10 分钟未答且没有推荐，已让调度员问架构师`);
+      }
+    }
+    pruneClock(clock, open);
+    if (JSON.stringify(clock) !== before) {
+      mkdirSync(watchDir(), { recursive: true });
+      writeAtomic(decisionClockFile(), `${JSON.stringify(clock, null, 2)}\n`);
+    }
+    return out;
+  });
+  for (const reply of replies) await runWatch(async (state, io) => queueReply(state, reply, io));
+}
+
 export function keepWatching(paseo: PaseoApi): void {
   watchPaseo = paseo;
   if (watchTimer) return;
-  watchTimer = setInterval(() => void runWatch(scanWorkers), SCAN_MS);
+  watchStartedAt = Date.now();
+  watchTimer = setInterval(() => void runWatch(scanAndMark), SCAN_MS);
   watchTimer.unref?.();
   cleanupTimer = setInterval(() => void autoCleanup(), CLEANUP_CHECK_MS);
   cleanupTimer.unref?.();
+  decisionTimer = setInterval(
+    () => void timeOutDecisions().catch((error) => logWatch(`待拍板超时检查出错：${(error as Error).message}`)),
+    DECISION_CHECK_MS,
+  );
+  decisionTimer.unref?.();
   logWatch("巡检已启动");
   void runWatch(scanWorkers);
   // A minute in, so opening the page is not slowed by a cleanup that happens to be due.
@@ -1097,8 +1315,10 @@ export function keepWatching(paseo: PaseoApi): void {
 export function stopWatching(): void {
   if (watchTimer) clearInterval(watchTimer);
   if (cleanupTimer) clearInterval(cleanupTimer);
+  if (decisionTimer) clearInterval(decisionTimer);
   watchTimer = null;
   cleanupTimer = null;
+  decisionTimer = null;
   watchPaseo = null;
 }
 
@@ -1171,9 +1391,77 @@ export function dismissError(input: { dispatcherId: string }) {
     const entry = stateOf(state, input.dispatcherId);
     if (!entry.lastError) return { ok: false };
     entry.lastError = null;
+    entry.pushableKept = [];
     saveState(layout, state);
     return { ok: true };
   });
+}
+
+/**
+ * Forgets archived dispatcher sessions on the page. The sessions stay archived in Paseo; only this list lets go.
+ * Kept: predecessors on a lane that is still open (the lane's archive finds its workers through them), and ended lanes
+ * with a worker not yet archived (a worker finishing later finds its gone dispatcher through them).
+ */
+export function clearArchivedSessions(paseo: PaseoApi) {
+  return exclusive(async () => {
+    const state = loadState(layout);
+    const total = { cleared: 0, workersLeft: 0, laneOpen: 0 };
+    for (const [dispatcherId, entry] of Object.entries(state.dispatchers)) {
+      const result = await clearArchivedOf(paseo, dispatcherId, entry);
+      total.cleared += result.cleared;
+      total.workersLeft += result.workersLeft;
+      total.laneOpen += result.laneOpen;
+    }
+    if (total.cleared > 0) {
+      saveState(layout, state);
+      const { registry } = loadRegistry(layout);
+      if (registry) writeBoards(registry, state);
+    }
+    logWatch(`清空已归档调度员会话：清掉 ${total.cleared}，执行会话没归档完留下 ${total.workersLeft}，会话线还开着留下 ${total.laneOpen}`);
+    return total;
+  });
+}
+
+/** Edits `entry.history` in place; the caller saves. */
+async function clearArchivedOf(paseo: PaseoApi, dispatcherId: string, entry: DispatcherState) {
+  const onLane = new Set(entry.lanes.map((lane) => lane.agentId));
+  const groups = new Map<string, { laneKey: string | null; agents: string[] }>();
+  let laneOpen = 0;
+  for (const item of entry.history) {
+    if (onLane.has(item.agentId)) continue;
+    if (item.laneId && laneOf(entry, item.laneId)) {
+      laneOpen += 1;
+      continue;
+    }
+    const key = item.laneId ? `lane:${item.laneId}` : `agent:${item.agentId}`;
+    const group = groups.get(key) ?? { laneKey: item.laneId ? `${dispatcherId}/${item.laneId}` : null, agents: [] };
+    group.agents.push(item.agentId);
+    groups.set(key, group);
+  }
+  // Only records: a session still live in Paseo is not archived and stays listed.
+  const statuses = new Map<string, string | null>();
+  for (const group of groups.values()) for (const agentId of group.agents) statuses.set(agentId, await agentStatus(paseo, agentId));
+  const isRecord = (agentId: string) => {
+    const status = statuses.get(agentId);
+    return !status || status === "archived";
+  };
+  const candidates = [...groups.entries()].filter(([, group]) => group.agents.every(isRecord));
+  const parents = new Set(candidates.flatMap(([, group]) => group.agents));
+  const laneKeys = new Set(candidates.flatMap(([, group]) => (group.laneKey ? [group.laneKey] : [])));
+  if (parents.size === 0) return { cleared: 0, workersLeft: 0, laneOpen };
+  const unfinished = (await allChildren(paseo, parents, laneKeys)).filter((agent) => !agent.archivedAt);
+  const cleared = new Set<string>();
+  let workersLeft = 0;
+  for (const [, group] of candidates) {
+    const own = new Set(group.agents);
+    const mine = unfinished.filter(
+      (agent) => own.has(agent.labels[PARENT_LABEL]) || (group.laneKey && startedByLane(agent.labels, new Set([group.laneKey]))),
+    );
+    if (mine.length > 0) workersLeft += group.agents.length;
+    else for (const agentId of group.agents) cleared.add(agentId);
+  }
+  if (cleared.size > 0) entry.history = entry.history.filter((item) => !cleared.has(item.agentId));
+  return { cleared: cleared.size, workersLeft, laneOpen };
 }
 
 export function archive(paseo: PaseoApi, input: { dispatcherId: string; agentId: string }) {
@@ -1363,46 +1651,99 @@ export async function listWorkspaces(paseo: PaseoApi) {
 
 /** Only what the user ticked, and only if it still passes now. Archiving may delete a worktree, so nothing else qualifies. */
 export function archiveWorkspaces(paseo: PaseoApi, input: { ids: string[] }) {
+  return exclusive(() => archiveCheckedWorkspaces(paseo, input.ids));
+}
+
+/**
+ * For workspaces held back only because their branch exists nowhere else: push each branch once (several workspaces
+ * often share one worktree), then archive under the usual checks. Anything else in the way still blocks; a failed push
+ * archives nothing on that directory.
+ */
+export function pushAndArchiveWorkspaces(paseo: PaseoApi, input: { ids: string[]; dispatcherId?: string }) {
   return exclusive(async () => {
-    const items = new Map((await assessWorkspaces(paseo, new Set(input.ids))).map((item) => [item.id, item]));
-    const archived: string[] = [];
-    const backedUp = new Map<string, string | null>();
-    const archivedOn = new Map<string, number>();
+    const items = await assessWorkspaces(paseo, new Set(input.ids));
+    const pushed: string[] = [];
     const skipped: { id: string; name: string; reason: string }[] = [];
-    for (const id of input.ids) {
-      const item = items.get(id);
-      if (!item) {
-        skipped.push({ id, name: id, reason: "工作区已不存在" });
-        continue;
-      }
-      if (item.blockers.length > 0) {
-        skipped.push({ id, name: item.name, reason: item.blockers.join("；") });
-        continue;
-      }
-      const last = lastMainRow(item, archivedOn);
-      if (last) {
-        skipped.push({ id, name: item.name, reason: last });
-        continue;
-      }
+    const failedOn = new Map<string, string>();
+    const doneOn = new Set<string>();
+    for (const item of items) {
+      // Set only when nothing but the push stands in the way.
+      if (!item.pushTo || !item.branch || doneOn.has(item.directory) || failedOn.has(item.directory)) continue;
       try {
-        backupEnvBeforeRemoval(item, backedUp, false);
+        await pushCheckoutBranch(item.directory, { branch: item.branch, remote: item.pushTo });
+        doneOn.add(item.directory);
+        pushed.push(`${item.branch} → ${item.pushTo}`);
+        logWatch(`推送分支 ${item.branch} 到 ${item.pushTo}（${item.directory}），为归档工作区`);
       } catch (error) {
-        skipped.push({ id, name: item.name, reason: `备份 .env 没成功，不删：${(error as Error).message}` });
-        continue;
-      }
-      try {
-        const result = await paseo.workspaces.archive(id);
-        if (result.error) throw new Error(result.error);
-        archived.push(id);
-        archivedOn.set(item.directory, (archivedOn.get(item.directory) ?? 0) + 1);
-        logWatch(`归档工作区 ${id}（${item.name}）${item.removesDirectory ? `，带 worktree ${item.directory}` : ""}`);
-      } catch (error) {
-        skipped.push({ id, name: item.name, reason: (error as Error).message });
-        logWatch(`归档工作区失败 ${id}：${(error as Error).message}`);
+        failedOn.set(item.directory, (error as Error).message);
+        logWatch(`推送失败 ${item.directory}：${(error as Error).message}`);
       }
     }
-    return { archived, skipped };
+    const tryIds: string[] = [];
+    for (const id of input.ids) {
+      const item = items.find((entry) => entry.id === id);
+      const failed = item && failedOn.get(item.directory);
+      if (item && failed) skipped.push({ id, name: item.name, reason: failed });
+      else tryIds.push(id);
+    }
+    const result = tryIds.length > 0 ? await archiveCheckedWorkspaces(paseo, tryIds) : { archived: [], skipped: [] };
+    const allSkipped = [...skipped, ...result.skipped];
+    // Started from the dispatcher's notice: it is resolved once nothing it listed is left.
+    if (input.dispatcherId) {
+      const state = loadState(layout);
+      const entry = state.dispatchers[input.dispatcherId];
+      if (entry) {
+        const left = new Set(allSkipped.map((item) => item.id));
+        entry.pushableKept = entry.pushableKept.filter((id) => left.has(id));
+        if (entry.pushableKept.length === 0 && allSkipped.length === 0) entry.lastError = null;
+        else if (allSkipped.length > 0)
+          entry.lastError = `推送并归档后还有 ${allSkipped.length} 个工作区留着：\n${allSkipped.map((item) => `· ${item.name}：${item.reason}`).join("\n")}`;
+        saveState(layout, state);
+      }
+    }
+    return { pushed, archived: result.archived, skipped: allSkipped };
   });
+}
+
+async function archiveCheckedWorkspaces(paseo: PaseoApi, ids: readonly string[]) {
+  const items = new Map((await assessWorkspaces(paseo, new Set(ids))).map((item) => [item.id, item]));
+  const archived: string[] = [];
+  const backedUp = new Map<string, string | null>();
+  const archivedOn = new Map<string, number>();
+  const skipped: { id: string; name: string; reason: string }[] = [];
+  for (const id of ids) {
+    const item = items.get(id);
+    if (!item) {
+      skipped.push({ id, name: id, reason: "工作区已不存在" });
+      continue;
+    }
+    if (item.blockers.length > 0) {
+      skipped.push({ id, name: item.name, reason: item.blockers.join("；") });
+      continue;
+    }
+    const last = lastMainRow(item, archivedOn);
+    if (last) {
+      skipped.push({ id, name: item.name, reason: last });
+      continue;
+    }
+    try {
+      backupEnvBeforeRemoval(item, backedUp, false);
+    } catch (error) {
+      skipped.push({ id, name: item.name, reason: `备份 .env 没成功，不删：${(error as Error).message}` });
+      continue;
+    }
+    try {
+      const result = await paseo.workspaces.archive(id);
+      if (result.error) throw new Error(result.error);
+      archived.push(id);
+      archivedOn.set(item.directory, (archivedOn.get(item.directory) ?? 0) + 1);
+      logWatch(`归档工作区 ${id}（${item.name}）${item.removesDirectory ? `，带 worktree ${item.directory}` : ""}`);
+    } catch (error) {
+      skipped.push({ id, name: item.name, reason: (error as Error).message });
+      logWatch(`归档工作区失败 ${id}：${(error as Error).message}`);
+    }
+  }
+  return { archived, skipped };
 }
 
 /**
@@ -1411,7 +1752,13 @@ export function archiveWorkspaces(paseo: PaseoApi, input: { ids: string[] }) {
  * so archiving the sessions alone leaves them all behind.
  */
 function newCascadeCounts() {
-  return { archived: 0, running: 0, failed: 0, workspacesArchived: 0, workspacesKept: [] as { name: string; reason: string }[] };
+  return {
+    archived: 0,
+    running: 0,
+    failed: 0,
+    workspacesArchived: 0,
+    workspacesKept: [] as { id: string; name: string; reason: string; pushable: boolean }[],
+  };
 }
 
 /**
@@ -1429,7 +1776,7 @@ async function archiveSafeWorkspaces(paseo: PaseoApi, workspaceIds: ReadonlySet<
     const last = blockers.length === 0 ? lastMainRow(item, archivedOn) : null;
     if (last) blockers.push(last);
     if (blockers.length > 0) {
-      counts.workspacesKept.push({ name: item.name, reason: blockers.join("；") });
+      counts.workspacesKept.push({ id: item.id, name: item.name, reason: blockers.join("；"), pushable: !!item.pushTo && blockers.length === 1 });
       logWatch(`工作区未归档 ${item.id}（${item.name}）：${blockers.join("；")}`);
       continue;
     }
@@ -1437,7 +1784,7 @@ async function archiveSafeWorkspaces(paseo: PaseoApi, workspaceIds: ReadonlySet<
       backupEnvBeforeRemoval(item, backedUp, true);
     } catch (error) {
       const reason = `备份 .env 没成功，不删：${(error as Error).message}`;
-      counts.workspacesKept.push({ name: item.name, reason });
+      counts.workspacesKept.push({ id: item.id, name: item.name, reason, pushable: false });
       logWatch(`工作区未归档 ${item.id}（${item.name}）：${reason}`);
       continue;
     }
@@ -1497,8 +1844,80 @@ export function archiveLeftoverWorkers(paseo: PaseoApi) {
   });
 }
 
+interface UnlandedBranch {
+  project: string;
+  branch: string;
+  landing: string;
+}
+
+/**
+ * Branches the lane's workers were on whose work is not on the lane's landing branch yet. A worker's branch is read
+ * from its checkout, else from the task card's 预期分支 it was labelled with; a branch already deleted is not counted.
+ */
+async function unlandedBranches(paseo: PaseoApi, dispatcherId: string, entry: DispatcherState, lane: Lane): Promise<UnlandedBranch[]> {
+  const projects = lane.projects.filter((project) => landingOf(project) && existsSync(project.path));
+  if (projects.length === 0) return [];
+  const parents = new Set([lane.agentId, ...entry.history.filter((item) => item.laneId === lane.id).map((item) => item.agentId)]);
+  const workers = await allChildren(paseo, parents, new Set([`${dispatcherId}/${lane.id}`]));
+  const seen = new Set<string>();
+  const found: UnlandedBranch[] = [];
+  for (const worker of workers) {
+    const present = !!worker.cwd && existsSync(worker.cwd);
+    const branch = (present ? await currentBranch(worker.cwd).catch(() => null) : null) ?? worker.labels[BRANCH_LABEL] ?? null;
+    if (!branch) continue;
+    for (const project of projects) {
+      const landing = landingOf(project)!;
+      if (branch === landing || seen.has(`${project.key}\0${branch}`)) continue;
+      if (present && !(await sameRepository(worker.cwd, project.path))) continue;
+      seen.add(`${project.key}\0${branch}`);
+      // null: the branch is not in this repository, or is gone.
+      if ((await branchLandsOn(project.path, branch, landing).catch(() => null)) === false) found.push({ project: project.name, branch, landing });
+    }
+  }
+  return found;
+}
+
+/** Asked before the page offers 归档: what still has to be merged into the landing branch. */
+export async function laneLanding(paseo: PaseoApi, input: { dispatcherId: string; laneId: string }) {
+  const state = loadState(layout);
+  const entry = stateOf(state, input.dispatcherId);
+  const lane = laneOf(entry, input.laneId);
+  if (!lane) throw new Error(`没有会话线 ${input.laneId}`);
+  return {
+    landings: lane.projects.flatMap((project) => {
+      const landing = landingOf(project);
+      return landing ? [{ project: project.name, landing }] : [];
+    }),
+    unlanded: await unlandedBranches(paseo, input.dispatcherId, entry, lane),
+  };
+}
+
+/** 让调度员收口: the user's go-ahead to merge the lane's branches back into its landing branch. Push stays a separate ask. */
+export function landLane(paseo: PaseoApi, input: { dispatcherId: string; laneId: string }) {
+  return exclusive(async () => {
+    const state = loadState(layout);
+    const entry = stateOf(state, input.dispatcherId);
+    const lane = laneOf(entry, input.laneId);
+    if (!lane) throw new Error(`没有会话线 ${input.laneId}`);
+    if (lane.pendingHandoff) throw new Error("换班进行中，等接班完成后再收口");
+    const status = await agentStatus(paseo, lane.agentId);
+    if (status && BUSY.has(status)) throw new Error("该会话线正在执行，等本轮结束再收口");
+    if (!status || status === "archived") throw new Error("该会话线的调度员已不在，没法让它收口");
+    const unlanded = await unlandedBranches(paseo, input.dispatcherId, entry, lane);
+    if (unlanded.length === 0) return { sent: false, unlanded };
+    const list = unlanded.map((item) => `- 「${item.project}」${item.branch} → ${item.landing}`).join("\n");
+    await paseo.agents.ref(lane.agentId).send(
+      `收口：用户在调度员页面点了「让调度员收口」，同意把本线下面这些分支合回收口分支（算第 13 节合回的点头；push 仍要另问）：\n${list}\n` +
+        "按顺序做：① 每个分支先确认已验收，没验收的先验收或上报，不合；② 先把收口分支的新提交合进来，有冲突停下报告，禁止 -X theirs；③ 合回收口分支后，在收口分支上跑一次该项目的回归测试，写进台账；④ 撤掉这些分支的 worktree，再删本地分支（远程分支要删先列给用户）。" +
+        "做完说一句「已收口」，并列出收口分支的 SHA 和测试结果，用户再归档本线。",
+    );
+    logWatch(`让会话线 ${lane.id} 收口：${unlanded.map((item) => `${item.branch}→${item.landing}`).join("、")}`);
+    return { sent: true, unlanded };
+  });
+}
+
 /** The page's 归档 on a lane: the session, the lane's seat and projects, and every worker the lane started. */
-export function archiveLane(paseo: PaseoApi, input: { dispatcherId: string; laneId: string }) {
+export function archiveLane(paseo: PaseoApi, input: { dispatcherId: string; laneId: string; force?: boolean }) {
   return exclusive(async () => {
     const registry = requireRegistry();
     const state = loadState(layout);
@@ -1506,6 +1925,11 @@ export function archiveLane(paseo: PaseoApi, input: { dispatcherId: string; lane
     const lane = laneOf(entry, input.laneId);
     if (!lane) throw new Error(`没有会话线 ${input.laneId}`);
     if (lane.pendingHandoff) throw new Error("换班进行中，等接班完成或取消换班后再归档");
+    if (!input.force) {
+      const unlanded = await unlandedBranches(paseo, input.dispatcherId, entry, lane);
+      if (unlanded.length > 0)
+        throw new Error(`还有 ${unlanded.length} 个分支没合回收口分支：${unlanded.map((item) => `${item.branch} → ${item.landing}`).join("、")}。先让调度员收口，或确认不要后选「仍然归档」`);
+    }
     const status = await agentStatus(paseo, lane.agentId);
     if (status && BUSY.has(status)) throw new Error("该会话线正在执行，等本轮结束再归档");
     // A session that is already gone or archived has nothing to archive; the lane still has to give back its seat.
@@ -1551,14 +1975,22 @@ export function onSessionArchived(paseo: PaseoApi, agentId: string): void {
  * Archiving from outside the page has nowhere to show a toast, so workspaces the cascade refused are put on the
  * dispatcher's page, where its other problems already show. Without this the reason lived only in the watch log.
  */
-function noteKeptWorkspaces(agentId: string, kept: readonly { name: string; reason: string }[]): void {
+function noteKeptWorkspaces(agentId: string, kept: readonly { id: string; name: string; reason: string; pushable: boolean }[]): void {
   const { registry } = loadRegistry(layout);
   if (!registry) return;
   const state = loadState(layout);
   const entry = Object.values(state.dispatchers).find((item) => item.history.some((hit) => hit.agentId === agentId));
   if (!entry) return;
   const lines = kept.map((item) => `· ${item.name}：${item.reason}`);
-  entry.lastError = `会话 ${agentId.slice(0, 8)} 已归档，但有 ${kept.length} 个工作区没有跟着归档：\n${lines.join("\n")}\n处理掉原因（比如先推送提交）后，到「工作区清理」里归档。`;
+  const pushable = kept.filter((item) => item.pushable).map((item) => item.id);
+  const next =
+    pushable.length === kept.length
+      ? "提交只在本地，点「推送并归档」把分支推到远端（不强推）后一起归档。"
+      : pushable.length > 0
+        ? `其中 ${pushable.length} 个点「推送并归档」即可；其余处理掉原因后，到「工作区清理」里归档。`
+        : "处理掉原因后，到「工作区清理」里归档。";
+  entry.lastError = `会话 ${agentId.slice(0, 8)} 已归档，但有 ${kept.length} 个工作区没有跟着归档：\n${lines.join("\n")}\n${next}`;
+  entry.pushableKept = pushable;
   saveState(layout, state);
   writeBoards(registry, state);
 }
@@ -1655,6 +2087,8 @@ export function onAgentCreated(paseo: PaseoApi, agent: { id: string; cwd: string
 
 /** Paseo records the creating agent under this label, so it identifies every sub-agent however it was started. */
 const PARENT_LABEL = "paseo.parent-agent-id";
+/** The task card's 预期分支, so the lane's archive can tell which branches it opened even after their worktree is gone. */
+const BRANCH_LABEL = "dispatch-center/branch";
 
 /** §1.4 counts running sub-agents across all lanes, including any started without dispatch_work. */
 async function runningChildren(paseo: PaseoApi) {
@@ -1665,12 +2099,43 @@ async function runningChildren(paseo: PaseoApi) {
   return result.entries.map((entry) => entry.agent).filter((agent) => agent.labels[PARENT_LABEL]);
 }
 
+/**
+ * Running workers a dispatcher sent out: tagged with the dispatcher label (dispatch_work and the rules' `paseo run`
+ * both set it), or started by a lane's dispatcher session. Sub-agents of the user's own sessions don't count
+ * against the dispatcher's caps.
+ */
 async function runningWorkers(paseo: PaseoApi) {
-  const workers = await runningChildren(paseo);
+  const laneAgents = new Set(allLanes(loadState(layout)).map(({ lane }) => lane.agentId));
+  const workers = (await runningChildren(paseo)).filter(
+    (agent) => agent.labels[LABEL_DISPATCHER] || laneAgents.has(agent.labels[PARENT_LABEL]),
+  );
   return {
     total: workers.length,
     claude: workers.filter((agent) => agent.provider.toLowerCase().includes("claude")).length,
   };
+}
+
+/**
+ * Answers open decisions from the page. The ledger is ticked right away, so the count drops at once; the answer
+ * reaches the lane's dispatcher through the notice queue, which waits until it is idle instead of interrupting it.
+ */
+export async function answerDecisions(
+  paseo: PaseoApi,
+  input: { dispatcherId: string; laneId: string; lines: string[]; answer: string },
+) {
+  const lane = await exclusive(async () => {
+    const found = stateOf(loadState(layout), input.dispatcherId).lanes.find((item) => item.id === input.laneId);
+    if (!found) throw new Error("这条会话线已经不在了");
+    const ledger = existsSync(found.ledgerPath) ? readFileSync(found.ledgerPath, "utf8") : "";
+    writeAtomic(found.ledgerPath, markDecisions(ledger, input.lines, input.answer, new Date()));
+    return found;
+  });
+  const items = input.lines.map((line) => `- ${line.replace(/^\s*(?:[-*]|\d+\.)\s+\[ \]\s*/, "")}`);
+  const text = [...items, `用户答复：${input.answer.trim()}`].join("\n");
+  keepWatching(paseo);
+  await runWatch(async (state, io) => queueReply(state, { laneAgentId: lane.agentId, text }, io));
+  void runWatch(scanWorkers);
+  return { queued: true };
 }
 
 /** The dispatch_work tool's description for a session in a dispatcher directory; null for every other session. */
@@ -1678,7 +2143,8 @@ export function workToolDescription(cwd: string): string | null {
   const { registry } = loadRegistry(layout);
   if (!registry || !dispatcherForCwd(layout, registry, cwd)) return null;
   return [
-    "派一个执行会话。你只判断角色并写理由、交齐任务卡字段；模型、模式、thinking、并行上限、建工作区由插件完成。",
+    "派一个执行会话。你只判断角色并写理由、交齐任务卡字段；模型、模式、thinking、额度预检、并行上限、建工作区、记台账由插件完成。",
+    "卡要短：插件会在卡末自动追加「必守」（核对工作区根/分支/HEAD、读代码黑名单、写完状态文件就停、禁止再开子 agent），各栏不要再写这些；「改与不改」最多 3 行只写范围；「其他」只写前面没出现的；一件事只在一栏里说一次。在已有提交上复跑、验收、续做时把 SHA 填进 head，插件派出前会核对，不用在正文里再写核对 SHA。插件不改你写的字，只在派单结果里提示哪里可以删。",
     "角色表：",
     renderRoleGuide(rolesOf(registry)),
   ].join("\n");
@@ -1696,7 +2162,11 @@ export function dispatchWork(paseo: PaseoApi, card: WorkCard, callerAgentId: str
     if (problems.length > 0) throw new Error(`任务卡不合格，没有派出：${problems.join("；")}`);
 
     const [profiles, catalog] = await Promise.all([loadProfiles(paseo).catch(() => []), tryCatalog(paseo)]);
-    const { chosen, skipped } = pickCandidate(role, profiles, card.avoid ?? [], catalog);
+    const quotas = await loadQuotas(registry.quotaUrl);
+    const { chosen, skipped } = pickCandidate(role, profiles, card.avoid ?? [], catalog, (config) =>
+      quotas ? quotaState(quotas, config.family, config.provider).blocked : null,
+    );
+    const lowQuota = chosen && quotas ? quotaState(quotas, chosen.family, chosen.provider).low : null;
     const passedOver = skipped.map((item) => `${item.label}：${item.reason}`).join("；");
     if (!chosen) throw new Error(`角色「${role.name}」的备选都不可用，没有派出，请上报用户。${passedOver}`);
     const statusProblem = statusFileProblem(card.statusFile, chosen.provider, registry.readOnlyDirs);
@@ -1717,6 +2187,13 @@ export function dispatchWork(paseo: PaseoApi, card: WorkCard, callerAgentId: str
       dispatcherId: found.dispatcherId,
       laneProjects: found.lane.projects,
     });
+    // Checked here, so a card on the wrong commit never starts a worker that would only stop and report it.
+    if (card.head) {
+      const actual = await headCommit(directory);
+      if (!actual || !actual.toLowerCase().startsWith(card.head.toLowerCase()))
+        throw new Error(`任务卡不合格，没有派出：预期 HEAD ${card.head}，${card.cwd} 实际是 ${actual?.slice(0, 12) ?? "不是 Git 目录"}`);
+    }
+    const workPrompt = renderWorkPrompt(card, role);
     const workspace = await paseo.workspaces.create({ source, title: card.title });
     let agentId: string;
     try {
@@ -1728,12 +2205,13 @@ export function dispatchWork(paseo: PaseoApi, card: WorkCard, callerAgentId: str
           featureValues: chosen.featureValues,
         },
         title: card.title,
-        prompt: renderWorkPrompt(card, role),
+        prompt: workPrompt,
         parent: callerAgentId,
         labels: {
           "dispatch-center/work-role": role.id,
           [LABEL_DISPATCHER]: found.dispatcherId,
           "dispatch-center/lane": found.lane.id,
+          [BRANCH_LABEL]: card.branch,
         },
       });
       agentId = agent.id;
@@ -1749,6 +2227,25 @@ export function dispatchWork(paseo: PaseoApi, card: WorkCard, callerAgentId: str
       statusFile: card.statusFile,
     };
     void runWatch(async (state, io) => recordDispatched(state, dispatched, io));
+    // The dispatcher used to write this row itself, and lost it whenever its turn was cut off mid-dispatch.
+    let ledgerNote = "把这个会话写进本线台账。";
+    try {
+      const ledgerPath = found.lane.ledgerPath;
+      const project =
+        found.lane.projects.find((item) => isInside(canonical(item.path), directory))?.name ?? workspace.id;
+      const updated = withRunningRow(existsSync(ledgerPath) ? readFileSync(ledgerPath, "utf8") : "", {
+        agentId,
+        workspaceId: workspace.id,
+        project,
+        cwd: directory,
+        branch: card.branch,
+        statusFile: card.statusFile,
+      });
+      if (updated !== null) writeAtomic(ledgerPath, updated);
+      ledgerNote = "插件已把它写进本线台账「在跑执行会话」，你不用再写；核验后更新阶段和下一步。";
+    } catch (error) {
+      ledgerNote = `插件没能写进台账（${(error as Error).message}），请你写进本线台账。`;
+    }
     return {
       agentId,
       workspaceId: workspace.id,
@@ -1758,7 +2255,10 @@ export function dispatchWork(paseo: PaseoApi, card: WorkCard, callerAgentId: str
       text: [
         `已派出 ${agentId}，角色「${role.name}」，配置 ${chosen.label}。`,
         passedOver ? `跳过的备选：${passedOver}。` : null,
-        "按第 6 节建心跳，并把这个会话写进本线台账。",
+        lowQuota ? `注意：${lowQuota}。` : null,
+        ledgerNote,
+        cardFeedback({ 任务: card.task, 改与不改: card.scope, 其他: card.notes }, workPrompt),
+        "派完结束本轮，等插件的执行会话状态通知，不用建心跳。",
       ]
         .filter(Boolean)
         .join("\n"),

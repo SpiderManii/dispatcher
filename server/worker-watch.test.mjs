@@ -6,9 +6,12 @@ import {
   MAX_SEND_ATTEMPTS,
   MAX_STATUS_FAILURES,
   REPEAT_WINDOW_MS,
+  REPLY_BATCH_MS,
   STUCK_MS,
   emptyWatch,
+  endedWithError,
   noticeText,
+  queueReply,
   recordDispatched,
   recordTurnEnd,
   scanWorkers,
@@ -35,10 +38,14 @@ function world(overrides = {}) {
     },
     findTarget: async (parent) => io.targets[parent] ?? null,
     dispatcherStatus: async () => io.dispatcher,
-    send: async (agentId, text) => {
+    send: async (agentId, text, messageId) => {
+      io.attempted.push(messageId);
       if (io.sendError) throw new Error(io.sendError);
-      io.sent.push({ agentId, text });
+      io.sent.push({ agentId, text, messageId });
     },
+    attempted: [],
+    idSeq: 0,
+    newMessageId: () => `m${++io.idSeq}`,
     files: {},
     readStatusFile: async (file) => {
       const value = io.files[file];
@@ -124,6 +131,58 @@ test("a busy dispatcher is not interrupted, and the notice goes out once it is i
   await scanWorkers(state, io);
   assert.equal(io.sent.length, 1);
   assert.equal(state.notices.length, 0);
+});
+
+test("a notice the dispatcher never started on stays queued and goes out again", async () => {
+  const io = world({ running: [worker()] });
+  const state = emptyWatch();
+  await scanWorkers(state, io);
+  io.running = [];
+  io.statuses.w1 = idle;
+  io.sendError = "调度员没开始处理这条通知（A foreground turn is already active）";
+  await scanWorkers(state, io);
+  assert.equal(state.notices.length, 1);
+  assert.ok(io.logs.some((line) => line.includes("发送失败，下次重试")));
+  io.sendError = null;
+  await scanWorkers(state, io);
+  assert.equal(io.sent.length, 1);
+  assert.equal(state.notices.length, 0);
+});
+
+test("a send reported as failed but answered after all is not sent again", async () => {
+  const io = world({ running: [worker()] });
+  const state = emptyWatch();
+  await scanWorkers(state, io);
+  io.running = [];
+  io.statuses.w1 = idle;
+  io.sendError = "调度员没开始处理这条通知";
+  await scanWorkers(state, io);
+  assert.deepEqual(io.attempted, ["m1"]);
+  io.sendError = null;
+  io.answered = async (_agent, messageId) => messageId === "m1";
+  await scanWorkers(state, io);
+  assert.equal(io.sent.length, 0);
+  assert.equal(state.notices.length, 0);
+  assert.ok(io.logs.some((line) => line.includes("已送到（重发前核对）")));
+});
+
+test("a retry that joins a new notice resends only what was not answered", async () => {
+  const io = world({ running: [worker(), worker({ id: "w2" })] });
+  const state = emptyWatch();
+  await scanWorkers(state, io);
+  io.running = [worker({ id: "w2" })];
+  io.statuses.w1 = idle;
+  io.sendError = "调度员没开始处理这条通知";
+  await scanWorkers(state, io);
+  io.running = [];
+  io.statuses.w2 = idle;
+  io.sendError = null;
+  io.answered = async (_agent, messageId) => messageId === "m1";
+  await scanWorkers(state, io);
+  assert.equal(io.sent.length, 1);
+  assert.match(io.sent[0].text, /w2/);
+  assert.doesNotMatch(io.sent[0].text, /w1/);
+  assert.equal(io.sent[0].messageId, "m2");
 });
 
 test("a pending notice and a watched worker survive a reload", async () => {
@@ -480,4 +539,147 @@ test("a failure is always reported, however often the worker has finished", asyn
   await scanWorkers(state, io);
   assert.equal(io.sent.length, MAX_ENDED_NOTICES + 1);
   assert.match(io.sent.at(-1).text, /失败/);
+});
+
+test("an answer from the page waits for an idle dispatcher and goes out under its own heading", async () => {
+  const io = world();
+  const state = emptyWatch();
+  queueReply(state, { laneAgentId: "dispatcher", text: "- A？\n用户答复：按推荐" }, io);
+  io.dispatcher = "running";
+  await scanWorkers(state, io);
+  assert.equal(io.sent.length, 0);
+  io.dispatcher = "idle";
+  io.time += REPLY_BATCH_MS;
+  await scanWorkers(state, io);
+  assert.equal(io.sent.length, 1);
+  assert.match(io.sent[0].text, /^【用户在调度员页面拍板】\n- A？\n用户答复：按推荐/);
+  assert.doesNotMatch(io.sent[0].text, /执行会话状态通知/);
+});
+
+test("an answer and a worker notice for the same lane go out in one message", async () => {
+  const io = world({ running: [worker()] });
+  const state = emptyWatch();
+  await scanWorkers(state, io);
+  io.running = [];
+  io.statuses.w1 = idle;
+  io.dispatcher = "running";
+  await scanWorkers(state, io);
+  queueReply(state, { laneAgentId: "dispatcher", text: "用户答复：好" }, io);
+  io.dispatcher = "idle";
+  io.time += REPLY_BATCH_MS;
+  await scanWorkers(state, io);
+  assert.equal(io.sent.length, 1);
+  assert.match(io.sent[0].text, /用户在调度员页面拍板[\s\S]*执行会话状态通知/);
+});
+
+test("a turn the provider cut off is not reported as finished", async () => {
+  const io = world({ running: [worker()] });
+  const state = emptyWatch();
+  await scanWorkers(state, io);
+  await recordTurnEnd(state, { workerId: "w1", parentAgentId: "dispatcher", provider: "cursor", outcome: { kind: "completed" } }, io);
+  io.lastReply = async () => "  Error: RetriableError: [canceled] http/2 stream closed with error code CANCEL (0x8)";
+  io.running = [];
+  io.statuses.w1 = idle;
+  await scanWorkers(state, io);
+  assert.equal(io.sent.length, 1);
+  assert.match(io.sent[0].text, /被网络或服务中断，这一轮没做完（RetriableError: \[canceled\] http\/2 stream closed/);
+  assert.match(io.sent[0].text, /直接给它发消息让它接着做，不用重派/);
+  assert.doesNotMatch(io.sent[0].text, /本轮已结束/);
+});
+
+test("a normal last reply still reads as finished, and an unreadable one too", async () => {
+  for (const reply of [async () => "已完成，状态文件已写。", async () => { throw new Error("no timeline"); }]) {
+    const io = world({ running: [worker()] });
+    const state = emptyWatch();
+    await scanWorkers(state, io);
+    await recordTurnEnd(state, { workerId: "w1", parentAgentId: "dispatcher", provider: "cursor", outcome: { kind: "completed" } }, io);
+    io.lastReply = reply;
+    io.running = [];
+    io.statuses.w1 = idle;
+    await scanWorkers(state, io);
+    assert.match(io.sent[0].text, /本轮已结束/);
+  }
+});
+
+test("retriable errors are interruptions, other errors are failures, prose mentioning errors is neither", () => {
+  assert.equal(endedWithError("Error: RetriableError: [aborted] Client network socket disconnected before secure TLS connection was established").kind, "interrupted");
+  assert.deepEqual(endedWithError("Error: model not found: grok-9"), { kind: "failed", detail: "model not found: grok-9" });
+  assert.equal(endedWithError("修好了 Error: 的处理逻辑"), null);
+  assert.equal(endedWithError(""), null);
+  assert.equal(endedWithError(null), null);
+});
+
+test("answers given one after another reach the dispatcher as one message", async () => {
+  const io = world();
+  const state = emptyWatch();
+  queueReply(state, { laneAgentId: "dispatcher", text: "- A？\n用户答复：按推荐" }, io);
+  await scanWorkers(state, io);
+  assert.equal(io.sent.length, 0);
+  io.time += 8_000;
+  queueReply(state, { laneAgentId: "dispatcher", text: "- B？\n用户答复：先给admin" }, io);
+  io.time += REPLY_BATCH_MS;
+  await scanWorkers(state, io);
+  assert.equal(io.sent.length, 1);
+  assert.match(io.sent[0].text, /A？[\s\S]*按推荐[\s\S]*B？[\s\S]*先给admin/);
+});
+
+test("an answer the dispatcher already took from the ledger is not sent again", async () => {
+  const io = world();
+  const state = emptyWatch();
+  queueReply(state, { laneAgentId: "dispatcher", text: "- A？\n用户答复：按推荐" }, io);
+  io.replyHandled = async () => true;
+  io.time += REPLY_BATCH_MS;
+  await scanWorkers(state, io);
+  assert.equal(io.sent.length, 0);
+  assert.equal(state.notices.length, 0);
+  assert.ok(io.logs.some((line) => line.includes("调度员已在台账里处理过这条答复")));
+});
+
+/** The worker runs again after its first report: the dispatcher sent it back, or the user typed to it. */
+async function secondTurn(io, state, { hook = false } = {}) {
+  io.time += REPEAT_WINDOW_MS * 2;
+  io.running = [worker({ title: null, turnStartedAt: iso(io.time) })];
+  await scanWorkers(state, io);
+  io.running = [];
+  if (hook)
+    await recordTurnEnd(state, { workerId: "w1", parentAgentId: "dispatcher", provider: "claude-container", outcome: { kind: "completed" } }, io);
+  await scanWorkers(state, io);
+}
+
+test("a rework round still names the worker and carries its status file", async () => {
+  for (const hook of [false, true]) {
+    const io = world();
+    io.files["/s/a.md"] = "状态: 待验收\nSHA: def456\n";
+    const state = await dispatchedAndEnded(io);
+    await secondTurn(io, state, { hook });
+    assert.equal(io.sent.length, 2, `hook=${hook}`);
+    assert.match(io.sent[1].text, /「前端-修复-页面」w1/);
+    assert.match(io.sent[1].text, /本线 dispatch_work 派出/);
+    assert.match(io.sent[1].text, /SHA: def456/);
+  }
+});
+
+test("a turn the user typed is marked as such; the dispatcher's own rework is not", async () => {
+  for (const [opener, marked] of [["user", true], ["agent", false], [null, false]]) {
+    const io = world({ turnOpener: async () => opener });
+    const state = await dispatchedAndEnded(io);
+    await secondTurn(io, state, { hook: true });
+    assert.equal(/用户直接发消息给它触发的/.test(io.sent[1].text), marked, `opener=${opener}`);
+  }
+});
+
+test("the launch turn is never taken for the user's, whatever the timeline says", async () => {
+  const io = world({ turnOpener: async () => "user" });
+  await dispatchedAndEnded(io);
+  assert.doesNotMatch(io.sent[0].text, /用户直接发消息/);
+});
+
+test("what is known about old workers is forgotten after a week", async () => {
+  const io = world();
+  const state = await dispatchedAndEnded(io);
+  assert.ok(state.known.w1);
+  io.time += 8 * 24 * 60 * 60_000;
+  recordDispatched(state, { id: "w2", provider: "x", parentAgentId: "dispatcher", title: "t2", statusFile: "/s/b.md" }, io);
+  assert.equal(state.known.w1, undefined);
+  assert.ok(state.known.w2);
 });

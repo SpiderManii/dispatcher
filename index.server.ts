@@ -1,16 +1,21 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { defineAgentTool } from "@getpaseo/plugin/server";
 import {
+  answerDecisionsRpc,
   archiveLaneRpc,
   archiveLeftoversRpc,
   archiveRpc,
   archiveWorkspacesRpc,
+  pushArchiveWorkspacesRpc,
   assignRpc,
   branchesRpc,
   browseRpc,
   cancelHandoffRpc,
+  clearArchivedRpc,
   dismissErrorRpc,
   handoffRpc,
+  landLaneRpc,
+  laneLandingRpc,
   overviewRpc,
   providerCatalogRpc,
   readDocRpc,
@@ -24,6 +29,7 @@ import {
 } from "./shared/contracts";
 import { workCardSchema } from "./server/roles";
 import {
+  answerDecisions,
   archive,
   archiveLane,
   archiveLeftoverWorkers,
@@ -33,10 +39,13 @@ import {
   bootstrapFor,
   browse,
   cancelHandoff,
+  clearArchivedSessions,
   dismissError,
   dispatchWork,
   handoff,
   keepWatching,
+  landLane,
+  laneLanding,
   listWorkspaces,
   onAgentCreated,
   onSessionArchived,
@@ -45,6 +54,7 @@ import {
   overview,
   prepareHome,
   providerCatalogView,
+  pushAndArchiveWorkspaces,
   readDoc,
   resolveTargets,
   rolesView,
@@ -72,14 +82,19 @@ export default function contribute(server: PluginServerContext) {
   server.handle(dismissErrorRpc, (input) => dismissError(input));
   server.handle(archiveRpc, (input, { paseo }) => archive(paseo, input));
   server.handle(archiveLaneRpc, (input, { paseo }) => archiveLane(paseo, input));
+  server.handle(laneLandingRpc, (input, { paseo }) => laneLanding(paseo, input));
+  server.handle(landLaneRpc, (input, { paseo }) => landLane(paseo, input));
   server.handle(archiveLeftoversRpc, (_input, { paseo }) => archiveLeftoverWorkers(paseo));
+  server.handle(clearArchivedRpc, (_input, { paseo }) => clearArchivedSessions(paseo));
   server.handle(workspacesRpc, (_input, { paseo }) => listWorkspaces(paseo));
   server.handle(archiveWorkspacesRpc, (input, { paseo }) => archiveWorkspaces(paseo, input));
+  server.handle(pushArchiveWorkspacesRpc, (input, { paseo }) => pushAndArchiveWorkspaces(paseo, input));
   server.handle(resolveTargetsRpc, (input) => resolveTargets(input));
   server.handle(branchesRpc, (input) => targetBranches(input));
   server.handle(assignRpc, (input, { paseo }) => assign(paseo, input));
   server.handle(browseRpc, (input, { paseo }) => browse(paseo, input));
   server.handle(readDocRpc, (input) => readDoc(input));
+  server.handle(answerDecisionsRpc, (input, { paseo }) => answerDecisions(paseo, input));
   server.handle(rolesRpc, (_input, { paseo }) => rolesView(paseo));
   server.handle(providerCatalogRpc, (input, { paseo }) => providerCatalogView(paseo, input));
   server.handle(saveAgentsRpc, (input) => saveAgents(input));

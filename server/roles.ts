@@ -3,6 +3,9 @@ import path from "node:path";
 import { z } from "zod";
 import type { ProviderCatalog } from "../shared/contracts";
 import { canonical, expandHome, isInside, type Registry, type RoleDef } from "./core";
+import { mustBlock } from "./work-card-text";
+
+export { cardFeedback } from "./work-card-text";
 
 
 /**
@@ -165,7 +168,14 @@ export function autoConfig(catalog: ProviderCatalog | null, avoid: string[] = []
 }
 
 /** First usable candidate in the role's order; everything passed over is reported back to the dispatcher. */
-export function pickCandidate(role: RoleDef, profiles: Profile[], avoid: string[], catalog: ProviderCatalog | null = null) {
+export function pickCandidate(
+  role: RoleDef,
+  profiles: Profile[],
+  avoid: string[],
+  catalog: ProviderCatalog | null = null,
+  /** Why this config can't take work right now (e.g. its quota is used up); null when it can. */
+  blocked: (config: ResolvedConfig) => string | null = () => null,
+) {
   const skipped: { label: string; reason: string }[] = [];
   if (role.candidates.length === 0) {
     const chosen = autoConfig(catalog, avoid);
@@ -179,6 +189,8 @@ export function pickCandidate(role: RoleDef, profiles: Profile[], avoid: string[
       skipped.push({ label: candidate.profile ?? candidate.provider ?? "?", reason: resolved.problem });
     } else if (resolved.family && avoided.has(resolved.family)) {
       skipped.push({ label: resolved.label, reason: `调度员要求避开 ${resolved.family}` });
+    } else if (blocked(resolved)) {
+      skipped.push({ label: resolved.label, reason: blocked(resolved) as string });
     } else {
       return { chosen: resolved, skipped };
     }
@@ -196,16 +208,22 @@ export const workCardSchema = z.object({
   cwd: required("目标 worktree 的绝对路径"),
   branch: required("预期分支"),
   task: required("要做什么，验收口径是什么"),
-  scope: required("改什么、不改什么"),
+  scope: required("改什么、不改什么，最多 3 行，只写范围，不重复「任务」里的步骤"),
   files: required("点名文件，没有写「无」"),
   testCommand: required("测试命令原文，不跑写「无」"),
   commitCommand: required("提交命令原文（含 §5 要求的提交身份和提交前步骤），不提交写「无」"),
   statusFile: required("状态文件绝对路径"),
-  notes: z.string().optional().describe("其他要交代的，可不填"),
+  notes: z.string().optional().describe("其他要交代的，只写前面各栏没有的信息，可不填"),
+  head: z
+    .string()
+    .trim()
+    .regex(/^[0-9a-f]{7,40}$/i, "预期 HEAD 要写提交 SHA")
+    .optional()
+    .describe("预期 HEAD SHA。在已有提交上复跑、验收、续做时填；插件派出前核对 cwd 的 HEAD，并写进卡头"),
   avoid: z
     .array(z.string())
     .optional()
-    .describe("本次要避开的家：codex、grok、antigravity、claude。按 §4 查到额度不够或撞了限流时填"),
+    .describe("本次要避开的家：codex、grok、antigravity、claude。额度插件已查；只在撞了限流或用户点名避开时填"),
 });
 export type WorkCard = z.infer<typeof workCardSchema>;
 
@@ -223,28 +241,26 @@ export function checkCard(card: WorkCard, dispatchHome: string): string[] {
 }
 
 export function renderWorkPrompt(card: WorkCard, role: RoleDef): string {
+  const notes = card.notes?.trim() ?? "";
   return [
     `# 任务卡：${card.title}`,
     `角色：${role.name}`,
     `cwd：${canonical(expandHome(card.cwd))}`,
     `预期分支：${card.branch}`,
+    card.head ? `预期 HEAD：${card.head}` : null,
     `## 任务\n${card.task}`,
     `## 改与不改\n${card.scope}`,
     `## 点名文件\n${card.files}`,
     `## 测试命令（原文）\n${card.testCommand}`,
     `## 提交命令（原文）\n${card.commitCommand}`,
     `## 状态文件\n${card.statusFile}`,
-    card.notes?.trim() ? `## 其他\n${card.notes.trim()}` : null,
-    [
-      "## 必守",
-      "- 首写前与提交前核 `git rev-parse --show-toplevel`、`--abbrev-ref HEAD`、HEAD SHA，与本卡不符立即停并上报。",
-      "- 黑名单：全仓 find；无路径 grep；node_modules、.next、tsbuildinfo、锁文件、构建产物；密钥与 .env 内容。",
-      "- 写完状态文件就停。禁止再开子 agent。",
-    ].join("\n"),
+    notes ? `## 其他\n${notes}` : null,
+    mustBlock(card.head),
   ]
     .filter(Boolean)
     .join("\n\n");
 }
+
 
 export function renderRoleGuide(roles: RoleDef[]): string {
   return roles.map((role) => `- ${role.id}（${role.name}）：${role.when}`).join("\n");

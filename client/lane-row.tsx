@@ -1,5 +1,6 @@
 import { Pressable, Text, View } from "react-native";
 import type { LaneView } from "../shared/contracts";
+import { Decisions } from "./decisions";
 import { Banner, Button, Chip, Glyph, StatusPill, duration, relativeTime, shortId, statusOf, toneColor, useKit } from "./ui";
 
 const HANDOFF_SLOW_MS = 15 * 60_000;
@@ -36,10 +37,12 @@ export function laneLabel(lane: LaneView): string {
 
 export function LaneRow({
   lane,
+  dispatcherId,
   actions,
   dispatcherName,
 }: {
   lane: LaneView;
+  dispatcherId: string;
   actions: CardActions;
   /** Shown only when several dispatchers share the list. */
   dispatcherName?: string;
@@ -67,7 +70,9 @@ export function LaneRow({
             </Text>
             {dispatcherName ? <Text style={s.muted}>{dispatcherName}</Text> : null}
             {lane.projects.map((project) =>
-              project.branch ? <Chip key={project.key} icon="GitBranch" label={project.branch} /> : null,
+              project.landing ?? project.branch ? (
+                <Chip key={project.key} icon="GitMerge" label={`收口 ${project.landing ?? project.branch}`} hint="本线的改动最后都合回这个分支" />
+              ) : null,
             )}
           </View>
           {lane.summary ? (
@@ -111,6 +116,8 @@ export function LaneRow({
           <Text style={s.muted}>台账 {lane.ledger.exists ? relativeTime(lane.ledger.updatedAt) : "未生成"}</Text>
         </Pressable>
       </View>
+
+      <Decisions lane={lane} dispatcherId={dispatcherId} />
 
       {agent?.lastError ? (
         <Text style={{ color: theme.colors.statusDanger, fontSize: 12 }} numberOfLines={2}>

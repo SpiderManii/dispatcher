@@ -110,10 +110,14 @@ export function ArchivedSessions({
   entries,
   onArchiveLeftovers,
   busy,
+  onClear,
+  clearing,
 }: {
   entries: HistoryEntry[];
   onArchiveLeftovers: () => void;
   busy: boolean;
+  onClear: () => void;
+  clearing: boolean;
 }) {
   const { s } = useKit();
   return (
@@ -124,14 +128,25 @@ export function ArchivedSessions({
           <Text style={s.h3}>已归档的调度员会话</Text>
           <Text style={s.muted}>{entries.length} 个</Text>
         </View>
-        <Button
-          small
-          icon="Archive"
-          label="清理它们留下的会话和工作区"
-          hint="调度员已归档、侧边栏还留着记录时用；在跑的不打断"
-          loading={busy}
-          onPress={onArchiveLeftovers}
-        />
+        <View style={s.row}>
+          <Button
+            small
+            icon="Archive"
+            label="清理它们留下的会话和工作区"
+            hint="调度员已归档、侧边栏还留着记录时用；在跑的不打断"
+            loading={busy}
+            onPress={onArchiveLeftovers}
+          />
+          <Button
+            small
+            variant="ghost"
+            icon="Trash2"
+            label="清空列表"
+            hint="不再显示这些已归档的会话；Paseo 里的归档记录不动"
+            loading={clearing}
+            onPress={onClear}
+          />
+        </View>
       </View>
       {entries.map((entry, index) => (
         <ArchivedRow key={`${entry.agentId}-${entry.startedAt}`} entry={entry} first={index === 0} />
