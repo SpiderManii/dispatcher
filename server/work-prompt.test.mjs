@@ -25,4 +25,5 @@ test("必守 names the expected HEAD only when the card has one", () => {
   assert.match(mustBlock("bab8b09e"), /与本卡的 cwd、预期分支、预期 HEAD不符立即停/);
   assert.doesNotMatch(mustBlock(undefined), /预期 HEAD/);
   assert.match(mustBlock(undefined), /黑名单：全仓 find/);
+  assert.match(mustBlock(undefined), /不输出明文.*生产环境凭据只有负责部署的角色/);
 });

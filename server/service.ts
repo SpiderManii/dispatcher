@@ -122,6 +122,7 @@ import { decideApproval } from "./auto-approve";
 import { CLEANUP_CHECK_MS, cleanupDue, parseCleanupRecord, type CleanupRecord } from "./auto-cleanup";
 import { backupEnvFiles, envFilesOf, safeSegment } from "./env-backup";
 import { assessWorkspace } from "./workspace-cleanup";
+import { mapLimit } from "./map-limit";
 import {
   architectReply,
   DECISION_CHECK_MS,
@@ -193,6 +194,9 @@ async function agentStatus(paseo: PaseoApi, agentId: string): Promise<string | n
 
 /** Retired sessions change rarely; cache their status so the 5s overview poll stays cheap. */
 const retiredStatusCache = new Map<string, { at: number; status: string | null }>();
+/** Sessions whose cascade the page's archive button runs itself, so the archived hook doesn't run a second one. */
+const cascadeOwned = new Set<string>();
+const ARCHIVE_CONCURRENCY = 4;
 const RETIRED_TTL_MS = 60_000;
 
 async function retiredStatus(paseo: PaseoApi, agentId: string): Promise<string | null> {
@@ -1810,13 +1814,10 @@ async function archiveChildren(
   const counts = newCascadeCounts();
   const children = await allChildren(paseo, parents, laneKeys);
   const workspaceIds = new Set<string>(ownWorkspaceIds);
-  for (const child of children) {
-    if (BUSY.has(child.status) && !child.archivedAt) {
-      counts.running += 1;
-      continue;
-    }
-    if (child.workspaceId) workspaceIds.add(child.workspaceId);
-    if (child.archivedAt) continue;
+  const idle = children.filter((child) => !(BUSY.has(child.status) && !child.archivedAt));
+  counts.running += children.length - idle.length;
+  for (const child of idle) if (child.workspaceId) workspaceIds.add(child.workspaceId);
+  await mapLimit(idle.filter((child) => !child.archivedAt), ARCHIVE_CONCURRENCY, async (child) => {
     try {
       await paseo.agents.ref(child.id).archive();
       counts.archived += 1;
@@ -1824,24 +1825,25 @@ async function archiveChildren(
       counts.failed += 1;
       logWatch(`连带归档失败 ${child.id}：${(error as Error).message}`);
     }
-  }
+  });
   await archiveSafeWorkspaces(paseo, workspaceIds, counts);
   return counts;
 }
 
 /** Workers left behind by dispatchers archived earlier, from before the cascade or when it missed them. */
-export function archiveLeftoverWorkers(paseo: PaseoApi) {
-  return exclusive(async () => {
+export async function archiveLeftoverWorkers(paseo: PaseoApi) {
+  const plan = await exclusive(async () => {
     const state = loadState(layout);
     const ended = Object.values(state.dispatchers).flatMap((entry) =>
       entry.history.map((item) => item.agentId).filter((agentId) => endedLaneParents(state, agentId)),
     );
     const statuses = await Promise.all(ended.map((agentId) => agentStatus(paseo, agentId)));
     const parents = new Set(ended.filter((_, index) => statuses[index] === "archived"));
-    const counts = await archiveChildren(paseo, parents, [], endedLaneKeys(state, parents));
-    logWatch(`补归档遗留：会话 ${counts.archived}，工作区 ${counts.workspacesArchived}，留下 ${counts.workspacesKept.length}，在跑 ${counts.running}，失败 ${counts.failed}`);
-    return counts;
+    return { parents, laneKeys: endedLaneKeys(state, parents) };
   });
+  const counts = await archiveChildren(paseo, plan.parents, [], plan.laneKeys);
+  logWatch(`补归档遗留：会话 ${counts.archived}，工作区 ${counts.workspacesArchived}，留下 ${counts.workspacesKept.length}，在跑 ${counts.running}，失败 ${counts.failed}`);
+  return counts;
 }
 
 interface UnlandedBranch {
@@ -1917,8 +1919,12 @@ export function landLane(paseo: PaseoApi, input: { dispatcherId: string; laneId:
 }
 
 /** The page's 归档 on a lane: the session, the lane's seat and projects, and every worker the lane started. */
-export function archiveLane(paseo: PaseoApi, input: { dispatcherId: string; laneId: string; force?: boolean }) {
-  return exclusive(async () => {
+/**
+ * Only the lane itself is archived under the lock. Its workers and workspaces go outside it: dozens of archives and git
+ * checks held the lock long enough that the page's 5-second overview polls timed out behind it.
+ */
+export async function archiveLane(paseo: PaseoApi, input: { dispatcherId: string; laneId: string; force?: boolean }) {
+  const released = await exclusive(async () => {
     const registry = requireRegistry();
     const state = loadState(layout);
     const entry = stateOf(state, input.dispatcherId);
@@ -1933,21 +1939,37 @@ export function archiveLane(paseo: PaseoApi, input: { dispatcherId: string; lane
     const status = await agentStatus(paseo, lane.agentId);
     if (status && BUSY.has(status)) throw new Error("该会话线正在执行，等本轮结束再归档");
     // A session that is already gone or archived has nothing to archive; the lane still has to give back its seat.
-    if (status && status !== "archived") await paseo.agents.ref(lane.agentId).archive();
+    cascadeOwned.add(lane.agentId);
+    try {
+      if (status && status !== "archived") await paseo.agents.ref(lane.agentId).archive();
+    } catch (error) {
+      cascadeOwned.delete(lane.agentId);
+      throw error;
+    }
     retiredStatusCache.set(lane.agentId, { at: Date.now(), status: "archived" });
     releaseLane(entry, lane.id, new Date());
     saveState(layout, state);
     writeBoards(registry, state);
-    // The lane's own workspace goes too: its session was just archived, and nothing else shares it.
+    return {
+      laneId: lane.id,
+      agentId: lane.agentId,
+      parents: new Set(endedLaneParents(state, lane.agentId) ?? [lane.agentId]),
+      // The lane's own workspace goes too: its session was just archived, and nothing else shares it.
+      workspaceIds: lane.workspaceId ? [lane.workspaceId] : [],
+    };
+  });
+  try {
     const counts = await archiveChildren(
       paseo,
-      new Set(endedLaneParents(state, lane.agentId) ?? [lane.agentId]),
-      lane.workspaceId ? [lane.workspaceId] : [],
-      new Set([`${input.dispatcherId}/${lane.id}`]),
+      released.parents,
+      released.workspaceIds,
+      new Set([`${input.dispatcherId}/${released.laneId}`]),
     );
-    logWatch(`归档会话线 ${lane.id}：会话 ${counts.archived}，工作区 ${counts.workspacesArchived}，留下 ${counts.workspacesKept.length}，在跑 ${counts.running}，失败 ${counts.failed}`);
+    logWatch(`归档会话线 ${released.laneId}：会话 ${counts.archived}，工作区 ${counts.workspacesArchived}，留下 ${counts.workspacesKept.length}，在跑 ${counts.running}，失败 ${counts.failed}`);
     return counts;
-  });
+  } finally {
+    cascadeOwned.delete(released.agentId);
+  }
 }
 
 /**
@@ -1955,20 +1977,25 @@ export function archiveLane(paseo: PaseoApi, input: { dispatcherId: string; lane
  * Unlike the page's button, only workers of archived sessions go; a sibling the user kept keeps its own.
  */
 export function onSessionArchived(paseo: PaseoApi, agentId: string): void {
-  void exclusive(async () => {
-    const { registry } = loadRegistry(layout);
-    if (!registry || !existsSync(layout.statePath)) return;
-    const state = loadState(layout);
-    await settleArchivedLanes(paseo, registry, state);
-    const parents = endedLaneParents(state, agentId);
-    if (!parents) return;
-    const statuses = await Promise.all(parents.map((parent) => agentStatus(paseo, parent)));
-    const archived = parents.filter((_, index) => statuses[index] === "archived");
-    const done = new Set([agentId, ...archived]);
-    const counts = await archiveChildren(paseo, done, [], endedLaneKeys(state, done));
+  if (cascadeOwned.has(agentId)) return;
+  void (async () => {
+    const plan = await exclusive(async () => {
+      const { registry } = loadRegistry(layout);
+      if (!registry || !existsSync(layout.statePath)) return null;
+      const state = loadState(layout);
+      await settleArchivedLanes(paseo, registry, state);
+      const parents = endedLaneParents(state, agentId);
+      if (!parents) return null;
+      const statuses = await Promise.all(parents.map((parent) => agentStatus(paseo, parent)));
+      const archived = parents.filter((_, index) => statuses[index] === "archived");
+      const done = new Set([agentId, ...archived]);
+      return { done, laneKeys: endedLaneKeys(state, done) };
+    });
+    if (!plan) return;
+    const counts = await archiveChildren(paseo, plan.done, [], plan.laneKeys);
     logWatch(`${agentId} 已归档：会话 ${counts.archived}，工作区 ${counts.workspacesArchived}，留下 ${counts.workspacesKept.length}，在跑 ${counts.running}，失败 ${counts.failed}`);
-    if (counts.workspacesKept.length > 0) noteKeptWorkspaces(agentId, counts.workspacesKept);
-  }).catch((error) => logWatch(`连带归档失败 ${agentId}：${(error as Error).message}`));
+    if (counts.workspacesKept.length > 0) await exclusive(async () => noteKeptWorkspaces(agentId, counts.workspacesKept));
+  })().catch((error) => logWatch(`连带归档失败 ${agentId}：${(error as Error).message}`));
 }
 
 /**

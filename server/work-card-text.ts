@@ -45,7 +45,8 @@ export function mustBlock(head: string | undefined): string {
   return [
     "## 必守",
     `- 首写前与提交前核 \`git rev-parse --show-toplevel\`、\`--abbrev-ref HEAD\`、HEAD SHA，与本卡的 cwd、预期分支${head ? "、预期 HEAD" : ""}不符立即停并上报。`,
-    "- 黑名单：全仓 find；无路径 grep；node_modules、.next、tsbuildinfo、锁文件、构建产物；密钥与 .env 内容。",
+    "- 黑名单：全仓 find；无路径 grep；node_modules、.next、tsbuildinfo、锁文件、构建产物。",
+    "- 密钥：不输出明文（不打印，不写进对话、日志、状态文件、台账、截图或提交）；本地 .env 让程序自行加载，不打开看值；生产环境凭据只有负责部署的角色在本卡写明授权时才可在内存读取，只读不改。",
     "- 写完状态文件就停。禁止再开子 agent。",
   ].join("\n");
 }

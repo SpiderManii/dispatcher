@@ -24,7 +24,7 @@ export interface WatchedWorker {
 }
 
 /** "reply" is not about a worker: it carries the user's answer from the page, sharing the queue's idle wait and delivery check. */
-export type NoticeKind = "ended" | "interrupted" | "failed" | "stuck" | "gone" | "reply";
+export type NoticeKind = "ended" | "interrupted" | "failed" | "stuck" | "gone" | "canceled" | "reply";
 
 export interface PendingNotice {
   workerId: string;
@@ -161,6 +161,8 @@ function describe(notice: PendingNotice): string {
       return "疑似卡死，约 60 分钟没有活动";
     case "gone":
       return "会话已不存在";
+    case "canceled":
+      return "部署卡被取消。取消只结束本机进程，它经 ssh 在服务器上启动的脚本可能还在跑。先派部署角色只读核对：目标服务的镜像、启动时间、环境变量，以及服务器上残留的部署进程（ps）。按实际线上状态决定下一步，不要当作什么都没发生";
     case "reply":
       return notice.detail ?? "";
   }
@@ -369,6 +371,11 @@ function updateRunning(state: WatchState, running: RunningWorker, io: WatchIo): 
  * A "completed" turn whose last reply is a provider error. Retriable ones (dropped connection, canceled stream,
  * TLS) only need a nudge to carry on; any other error is a failure.
  */
+/** Deploy cards are titled by role, e.g. 「部署-api-1a2b3c4d-billing」 or "deploy-api-1a2b3c4d". */
+export function isDeployWorker(title: string | null | undefined): boolean {
+  return typeof title === "string" && /^(部署|deploy)/i.test(title);
+}
+
 export function endedWithError(reply: string | null): { kind: "interrupted" | "failed"; detail: string } | null {
   const line = reply?.trim().split("\n")[0]?.trim() ?? "";
   if (!/^Error:/i.test(line)) return null;
@@ -390,7 +397,10 @@ async function settleStopped(state: WatchState, id: string, worker: WatchedWorke
   delete state.workers[id];
   const before = remember(state, id, { title: worker.title, statusFile: worker.statusFile ?? null }, io);
   remember(state, id, { settled: before.settled + 1 }, io);
-  if (worker.outcome?.kind === "canceled") return io.log(`不通知：${id} 被取消`);
+  if (worker.outcome?.kind === "canceled") {
+    if (isDeployWorker(worker.title)) return queue(state, id, worker, "canceled", null, io);
+    return io.log(`不通知：${id} 被取消`);
+  }
   if (!result) return queue(state, id, worker, "gone", null, io);
   if (result.status === "archived") return io.log(`不通知：${id} 已归档`);
   if (worker.outcome?.kind === "failed") return queue(state, id, worker, "failed", worker.outcome.message ?? null, io);

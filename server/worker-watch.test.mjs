@@ -256,6 +256,19 @@ test("a canceled worker is not reported", async () => {
   assert.equal(io.sent.length, 0);
 });
 
+test("a canceled deploy worker is reported, because its server-side script may still be running", async () => {
+  const io = world({ running: [worker({ title: "部署-api-1a2b3c4d重试-计费" })] });
+  const state = emptyWatch();
+  await scanWorkers(state, io);
+  await recordTurnEnd(state, { workerId: "w1", parentAgentId: "dispatcher", provider: "codex", outcome: { kind: "canceled" } }, io);
+  io.running = [];
+  io.statuses.w1 = idle;
+  await scanWorkers(state, io);
+  assert.equal(io.sent.length, 1);
+  assert.match(io.sent[0].text, /部署卡被取消/);
+  assert.match(io.sent[0].text, /残留的部署进程/);
+});
+
 test("a failed turn is reported with its message", async () => {
   const io = world({ running: [worker()] });
   const state = emptyWatch();

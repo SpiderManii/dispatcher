@@ -21,7 +21,7 @@
     "test": "node --experimental-transform-types --import ./scripts/register-ts.mjs --test \"server/*.test.mjs\" \"shared/*.test.mjs\" \"client/*.test.mjs\""
   },
   "devDependencies": {
-    "@getpaseo/plugin": "0.15.3",
+    "@getpaseo/plugin": "0.16.0",
     "@tanstack/react-query": "^5.90.11",
     "@types/react": "~19.2.0",
     "react": "19.1.0",
