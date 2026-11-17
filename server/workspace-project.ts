@@ -126,7 +126,10 @@ export interface CheckoutFacts {
   branch: string | null;
   /** A linked worktree, as opposed to the repository's main checkout. */
   linkedWorktree: boolean;
+  /** Changed or untracked files, not counting ones a build or typecheck writes again (see `generated`). */
   uncommitted: number;
+  /** Changed files a build or typecheck recreates, such as tsbuildinfo: losing them costs nothing, so they don't block. */
+  generated: string[];
   /** A ref other than this branch that holds HEAD's work; null when its commits exist nowhere else. */
   tipElsewhere: string | null;
   /**
@@ -166,6 +169,11 @@ export async function checkoutFacts(directory: string): Promise<CheckoutFacts | 
           .filter((line) => line.startsWith("!! "))
           .map((line) => line.slice(3).replace(/^"|"$/g, "").replace(/\/$/, ""))
           .filter((item) => !REBUILDABLE.test(item));
+  const changed = status
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => line.slice(3).split(" -> ").pop()!.replace(/^"|"$/g, "").replace(/\/$/, ""));
+  const generated = changed.filter((item) => REBUILDABLE.test(item));
   const branch = symbolic.trim() || null;
   const own = (ref: string) => !!ref && ref !== `refs/heads/${branch}` && ref !== "refs/stash";
   let tipElsewhere: string | null = null;
@@ -182,7 +190,8 @@ export async function checkoutFacts(directory: string): Promise<CheckoutFacts | 
   return {
     branch,
     linkedWorktree: canonical(gitDir.trim()) !== common,
-    uncommitted: status.split("\n").filter(Boolean).length,
+    uncommitted: changed.length - generated.length,
+    generated,
     tipElsewhere,
     landed,
     pushTo: branch ? await pushRemote(directory, branch) : null,

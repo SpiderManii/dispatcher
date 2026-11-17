@@ -7,7 +7,7 @@ import { after, before, test } from "node:test";
 import { assessWorkspace } from "./workspace-cleanup.ts";
 import { checkoutFacts } from "./workspace-project.ts";
 
-const checkout = (overrides = {}) => ({ branch: "feature", linkedWorktree: true, uncommitted: 0, tipElsewhere: "refs/heads/dev", landed: "contains", pushTo: null, ignored: [], ...overrides });
+const checkout = (overrides = {}) => ({ branch: "feature", linkedWorktree: true, uncommitted: 0, generated: [], tipElsewhere: "refs/heads/dev", landed: "contains", pushTo: null, ignored: [], ...overrides });
 const facts = (overrides = {}) => ({
   id: "wks_1",
   kind: "directory",
@@ -109,6 +109,7 @@ test("checkoutFacts reads a worktree whose tip is on another branch", async () =
     branch: "feature",
     linkedWorktree: true,
     uncommitted: 0,
+    generated: [],
     tipElsewhere: "refs/heads/dev",
     landed: "contains",
     pushTo: null,
@@ -135,6 +136,23 @@ test("checkoutFacts counts dirt, ignores rebuildable files, and notices commits 
   const ahead = await checkoutFacts(worktree);
   assert.equal(ahead.uncommitted, 0);
   assert.equal(ahead.tipElsewhere, null);
+});
+
+test("changed generated files such as tsbuildinfo warn but do not block archiving", async () => {
+  const result = assessWorkspace(facts({ kind: "worktree", checkout: checkout({ generated: ["tsconfig.tsbuildinfo"] }) }), NONE);
+  assert.deepEqual(result.blockers, []);
+  assert.match(result.warnings.join(""), /生成文件有改动.*tsconfig\.tsbuildinfo/);
+});
+
+test("checkoutFacts does not count a rewritten tsbuildinfo as uncommitted work", async () => {
+  writeFileSync(path.join(worktree, "tsconfig.tsbuildinfo"), "v1");
+  git(worktree, "add", "tsconfig.tsbuildinfo");
+  git(worktree, "commit", "-qm", "track build info");
+  writeFileSync(path.join(worktree, "tsconfig.tsbuildinfo"), "v2");
+  const found = await checkoutFacts(worktree);
+  assert.equal(found.uncommitted, 0);
+  assert.deepEqual(found.generated, ["tsconfig.tsbuildinfo"]);
+  git(worktree, "checkout", "--", "tsconfig.tsbuildinfo");
 });
 
 test("checkoutFacts is null outside Git", async () => {

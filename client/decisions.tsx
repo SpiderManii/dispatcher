@@ -3,7 +3,10 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { Pressable, Text, TextInput, View } from "react-native";
 import { answerDecisionsRpc, type LaneView } from "../shared/contracts";
+import { splitDecision } from "./decision-text";
 import { Button, Checkbox, Glyph, errorText, tint, useKit } from "./ui";
+
+export const STALE_ANSWER = "已过时，不用了";
 
 /**
  * A lane's open `- [ ]` decisions, answerable in place. Answering ticks them in the ledger at once; the dispatcher
@@ -17,6 +20,7 @@ export function Decisions({ lane, dispatcherId }: { lane: LaneView; dispatcherId
   const [selected, setSelected] = useState<string[]>([]);
   const [text, setText] = useState("");
   const [sent, setSent] = useState(false);
+  const [expanded, setExpanded] = useState<string[]>([]);
   const mutation = useMutation({
     mutationFn: (input: { lines: string[]; answer: string }) => answer({ dispatcherId, laneId: lane.id, ...input }),
     onSuccess: async () => {
@@ -62,21 +66,35 @@ export function Decisions({ lane, dispatcherId }: { lane: LaneView; dispatcherId
 
       {decisions.map((item) => {
         const checked = selected.includes(item.line);
+        const open = expanded.includes(item.line);
+        const { question, recommendation } = splitDecision(item.text);
         return (
           <View key={item.line} style={[s.row, { alignItems: "flex-start" }]}>
             <Pressable
               accessibilityRole="checkbox"
               accessibilityState={{ checked }}
-              accessibilityLabel={item.text}
+              accessibilityLabel={`选中：${question}`}
               onPress={() => toggle(item.line)}
-              style={({ pressed }) => [s.row, { flex: 1, alignItems: "flex-start", opacity: pressed ? 0.7 : 1 }]}
+              style={({ pressed }) => ({ paddingTop: 1, opacity: pressed ? 0.7 : 1 })}
             >
-              <View style={{ paddingTop: 1 }}>
-                <Checkbox checked={checked} />
-              </View>
-              <Text style={[s.small, { flex: 1, lineHeight: 18 }]} selectable>
-                {item.text}
+              <Checkbox checked={checked} />
+            </Pressable>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={open ? "收起全文" : "展开全文"}
+              onPress={() =>
+                setExpanded((list) => (list.includes(item.line) ? list.filter((line) => line !== item.line) : [...list, item.line]))
+              }
+              style={({ pressed }) => ({ flex: 1, gap: 2, opacity: pressed ? 0.7 : 1 })}
+            >
+              <Text style={[s.small, { lineHeight: 18 }]} numberOfLines={open ? undefined : 1} selectable={open}>
+                {question}
               </Text>
+              {recommendation ? (
+                <Text style={s.muted} numberOfLines={open ? undefined : 1}>
+                  推荐：{recommendation}
+                </Text>
+              ) : null}
             </Pressable>
             {item.hasRecommendation ? (
               <Button
@@ -86,6 +104,13 @@ export function Decisions({ lane, dispatcherId }: { lane: LaneView; dispatcherId
                 onPress={() => mutation.mutate({ lines: [item.line], answer: "按推荐" })}
               />
             ) : null}
+            <Button
+              small
+              variant="ghost"
+              label="已过时"
+              disabled={mutation.isPending}
+              onPress={() => mutation.mutate({ lines: [item.line], answer: STALE_ANSWER })}
+            />
           </View>
         );
       })}

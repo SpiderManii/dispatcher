@@ -112,11 +112,15 @@ export interface WatchIo {
   replyHandled?(laneAgentId: string, detail: string): Promise<boolean>;
   /** null when the file isn't there or can't be read. */
   readStatusFile(file: string): Promise<string | null>;
+  /** The lane's open `- [ ]` decisions, so a finished card can close the ones it made moot. */
+  openDecisions?(laneId: string): Promise<string[]>;
   /**
    * Who sent the message that opened the worker's last turn: "agent" when Paseo marks it as sent by another session
    * (the dispatcher, a launch), "user" when someone typed it. null when it can't be read.
    */
   turnOpener?(workerId: string): Promise<"agent" | "user" | null>;
+  /** Appends to the lane's event timeline, which the page shows and which survives reloads. */
+  event?(parentAgentId: string, event: { kind: NoticeKind; workerId: string; title: string | null; detail: string | null }): void;
   log(line: string): void;
   now(): number;
 }
@@ -179,12 +183,37 @@ function noticeLine(notice: PendingNotice, statuses: ReadonlyMap<string, string>
   return content ? `${line}\n  状态文件 ${notice.statusFile}（内容已附，不用再读）：\n${content.trim()}` : line;
 }
 
-export function noticeText(notices: PendingNotice[], statuses: ReadonlyMap<string, string> = new Map()): string {
+export const MAX_LISTED_DECISIONS = 8;
+
+function staleDecisionPart(workers: PendingNotice[], open: readonly string[]): string[] {
+  if (open.length === 0 || !workers.some((notice) => notice.kind === "ended" || notice.kind === "failed" || notice.kind === "canceled"))
+    return [];
+  const clip = (text: string) => (text.length > 80 ? `${text.slice(0, 80)}…` : text);
+  return [
+    "",
+    `本线还有 ${open.length} 条待拍板没收口：`,
+    ...open.slice(0, MAX_LISTED_DECISIONS).map((text) => `- ${clip(text)}`),
+    ...(open.length > MAX_LISTED_DECISIONS ? [`- …另 ${open.length - MAX_LISTED_DECISIONS} 条见台账`] : []),
+    "这次的结果让哪条不再需要，就在台账改成 `- [x] … → 已过时：原因`，免得用户在页面上还看到它；还需要的不动。",
+  ];
+}
+
+export function noticeText(
+  notices: PendingNotice[],
+  statuses: ReadonlyMap<string, string> = new Map(),
+  openDecisions: readonly string[] = [],
+): string {
   const replies = notices.filter((notice) => notice.kind === "reply");
   const workers = notices.filter((notice) => notice.kind !== "reply");
+  const automatic = (notice: PendingNotice) => (notice.detail ?? "").includes("自动答复：");
+  const header = replies.every(automatic)
+    ? "【待拍板超时，插件已自动按推荐答复】"
+    : replies.some(automatic)
+      ? "【待拍板答复：有用户在页面答复的，也有超时自动答复的，按每条注明的来源区分】"
+      : "【用户在调度员页面拍板】";
   const replyPart = replies.length
     ? [
-        "【用户在调度员页面拍板】",
+        header,
         ...replies.map((notice) => notice.detail ?? ""),
         "插件已在本线台账把这些条目标成 [x] 并写上答复。按答复继续；拍完的按第 13 节整理进决策记录。",
       ]
@@ -196,6 +225,7 @@ export function noticeText(notices: PendingNotice[], statuses: ReadonlyMap<strin
     ...workers.map((notice) => noticeLine(notice, statuses)),
     "标了「本线 dispatch_work 派出」的属于本线，台账里没有就补上，照常核验。其余的先确认在本线台账里，不在就回报用户，不要接管。",
     "被中断：发消息让它接着做，不重派、不算返修次数。已结束：看状态文件，按第 8 节核验后派下一步。失败、不存在或状态文件缺字段：按第 10 节处理或报阻塞。疑似卡死：按第 6 节看末尾几行再判断。不自己排查。",
+    ...staleDecisionPart(workers, openDecisions),
   ].join("\n");
 }
 
@@ -307,6 +337,7 @@ function queue(
   io: WatchIo,
   byUser = false,
 ) {
+  if (kind !== "reply") io.event?.(worker.parentAgentId, { kind, workerId: id, title: worker.title, detail });
   let finalRepeat = false;
   if (kind === "ended") {
     const endings: Record<string, number[]> = {};
@@ -397,6 +428,9 @@ async function settleStopped(state: WatchState, id: string, worker: WatchedWorke
   delete state.workers[id];
   const before = remember(state, id, { title: worker.title, statusFile: worker.statusFile ?? null }, io);
   remember(state, id, { settled: before.settled + 1 }, io);
+  if (worker.outcome?.kind === "canceled" && !isDeployWorker(worker.title)) {
+    io.event?.(worker.parentAgentId, { kind: "canceled", workerId: id, title: worker.title, detail: null });
+  }
   if (worker.outcome?.kind === "canceled") {
     if (isDeployWorker(worker.title)) return queue(state, id, worker, "canceled", null, io);
     return io.log(`不通知：${id} 被取消`);
@@ -469,7 +503,8 @@ async function deliverNotices(state: WatchState, io: WatchIo): Promise<void> {
     const messageId = io.newMessageId();
     for (const notice of notices) notice.messageId = messageId;
     try {
-      await io.send(target.agentId, noticeText(notices, await readStatuses(notices, io)), messageId);
+      const open = (await io.openDecisions?.(target.laneId).catch(() => [])) ?? [];
+      await io.send(target.agentId, noticeText(notices, await readStatuses(notices, io), open), messageId);
       remove();
       io.log(`已通知 ${target.agentId} lane=${target.laneId}：${ids()}`);
     } catch (error) {

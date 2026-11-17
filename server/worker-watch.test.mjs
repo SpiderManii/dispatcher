@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { recommendReply } from "./decision-timeout.ts";
 import { test } from "node:test";
 import {
   MAX_ENDED_NOTICES,
@@ -695,4 +696,27 @@ test("what is known about old workers is forgotten after a week", async () => {
   recordDispatched(state, { id: "w2", provider: "x", parentAgentId: "dispatcher", title: "t2", statusFile: "/s/b.md" }, io);
   assert.equal(state.known.w1, undefined);
   assert.ok(state.known.w2);
+});
+
+
+test("an automatic answer is never presented as the user's own choice", async () => {
+  const io = world({ running: [] });
+  const state = emptyWatch();
+  queueReply(state, { laneAgentId: "dispatcher", text: recommendReply([{ line: "- [ ] A？（推荐：是）", text: "A？（推荐：是）", hasRecommendation: true }]) }, io);
+  io.time += 30_000;
+  io.statuses.dispatcher = idle;
+  await scanWorkers(state, io);
+  assert.match(io.sent[0].text, /^【待拍板超时，插件已自动按推荐答复】/);
+  assert.doesNotMatch(io.sent[0].text, /用户在调度员页面拍板|用户答复：/);
+  assert.match(io.sent[0].text, /自动答复：按推荐（10 分钟未答，插件代答/);
+});
+
+test("a finished card's notice lists the lane's open decisions so the moot ones get closed", () => {
+  const ended = { workerId: "w1", title: "实现-A", provider: "codex", parentAgentId: "d", kind: "ended", detail: null, attempts: 0, queuedAt: 0 };
+  const text = noticeText([ended], new Map(), ["要不要合 dev？（推荐：先不合）"]);
+  assert.match(text, /本线还有 1 条待拍板没收口：\n- 要不要合 dev？（推荐：先不合）/);
+  assert.match(text, /已过时：原因/);
+  const stuck = { ...ended, kind: "stuck" };
+  assert.doesNotMatch(noticeText([stuck], new Map(), ["要不要合 dev？"]), /没收口/);
+  assert.doesNotMatch(noticeText([ended], new Map(), []), /没收口/);
 });

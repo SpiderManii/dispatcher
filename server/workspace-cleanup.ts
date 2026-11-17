@@ -66,6 +66,10 @@ export function assessWorkspace(facts: WorkspaceFacts, keep: ReadonlySet<string>
     if (facts.checkoutError) blockers.push(`读不到 Git 状态：${facts.checkoutError}`);
     else if (checkout) {
       if (checkout.uncommitted > 0) blockers.push(`${checkout.uncommitted} 个文件未提交`);
+      if (checkout.generated.length > 0) {
+        const shown = checkout.generated.slice(0, 3).join("、");
+        warnings.push(`生成文件有改动，会一起删除（可重新生成）：${shown}${checkout.generated.length > 3 ? ` 等 ${checkout.generated.length} 项` : ""}`);
+      }
       if (!checkout.tipElsewhere) {
         blockers.push(branch ? `分支 ${branch} 的提交只在这个分支上` : "当前提交没有其他分支包含");
         if (branch && checkout.pushTo) pushTo = checkout.pushTo;

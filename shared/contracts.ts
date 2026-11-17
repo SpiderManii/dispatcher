@@ -79,6 +79,18 @@ export const laneView = z.object({
   ledger: ledgerView,
   /** Asked of Paseo, not read from the ledger, whose rows outlive the sessions. null when Paseo couldn't answer. */
   runningWorkers: z.number().nullable(),
+  /** The cards running right now, from Paseo's running list. */
+  running: z.array(z.object({ id: z.string(), title: z.string().nullable(), since: z.string().nullable(), provider: z.string() })),
+  /** Newest first, from the lane's event timeline, which survives plugin reloads and Paseo restarts. */
+  events: z.array(
+    z.object({
+      at: z.string(),
+      kind: z.string(),
+      workerId: z.string().nullable(),
+      title: z.string().nullable(),
+      detail: z.string().nullable(),
+    }),
+  ),
   pendingHandoff: handoffInfo.nullable(),
 });
 export type LaneView = z.infer<typeof laneView>;
@@ -123,6 +135,8 @@ const overviewOutput = z.object({
   checkedAt: z.string(),
   /** The worker watch that wakes dispatchers in place of heartbeats. */
   watch: z.object({ startedAt: z.string().nullable(), lastScanAt: z.string().nullable(), error: z.string().nullable() }),
+  /** Which code is running: the plugin directory's commit when it loaded. */
+  plugin: z.object({ commit: z.string().nullable(), dirty: z.boolean(), loadedAt: z.string() }),
 });
 export type Overview = z.infer<typeof overviewOutput>;
 

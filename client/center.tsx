@@ -286,6 +286,12 @@ function Center({ navigation }: PluginScreenProps) {
               {overview.home}
             </Text>
           ) : null}
+          {overview ? (
+            <Text style={s.muted} numberOfLines={1} selectable>
+              插件 {overview.plugin.commit ?? "版本未知"}
+              {overview.plugin.dirty ? "（含未提交改动）" : ""} · 加载于 {relativeTime(overview.plugin.loadedAt)}
+            </Text>
+          ) : null}
         </View>
         <View style={s.row}>
           {overview ? <Text style={s.muted}>更新于 {relativeTime(overview.checkedAt)}</Text> : null}

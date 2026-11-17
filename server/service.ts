@@ -123,6 +123,10 @@ import { CLEANUP_CHECK_MS, cleanupDue, parseCleanupRecord, type CleanupRecord } 
 import { backupEnvFiles, envFilesOf, safeSegment } from "./env-backup";
 import { assessWorkspace } from "./workspace-cleanup";
 import { mapLimit } from "./map-limit";
+import { appendLaneEvent, recentLaneEvents, type LaneEventKind } from "./events";
+import { archiveBlock, runningTableAgents, slimLedger } from "./ledger-slim";
+import { readPluginBuild } from "./plugin-build";
+import { fileURLToPath } from "node:url";
 import {
   architectReply,
   DECISION_CHECK_MS,
@@ -561,14 +565,27 @@ function newLaneSpec(state: State, dispatcherId: string, projects: LaneProject[]
 }
 
 /** Running workers per parent agent; null when Paseo can't say, so the page shows "unknown" rather than a guess. */
-async function workerCountsByParent(paseo: PaseoApi): Promise<Map<string, number> | null> {
+interface RunningCard {
+  id: string;
+  title: string | null;
+  since: string | null;
+  provider: string;
+}
+
+async function workerCountsByParent(paseo: PaseoApi): Promise<Map<string, RunningCard[]> | null> {
   try {
-    const counts = new Map<string, number>();
+    const byParent = new Map<string, RunningCard[]>();
     for (const agent of await runningChildren(paseo)) {
       const parent = agent.labels[PARENT_LABEL];
-      counts.set(parent, (counts.get(parent) ?? 0) + 1);
+      const card = {
+        id: agent.id,
+        title: agent.title ?? null,
+        since: agent.activeTurn?.startedAt ?? null,
+        provider: agent.provider,
+      };
+      byParent.set(parent, [...(byParent.get(parent) ?? []), card]);
     }
-    return counts;
+    return byParent;
   } catch {
     return null;
   }
@@ -579,7 +596,7 @@ async function laneView(
   registry: Registry,
   lane: Lane,
   history: { agentId: string; laneId?: string | null }[],
-  workerCounts: Map<string, number> | null,
+  workerCounts: Map<string, RunningCard[]> | null,
 ): Promise<LaneView> {
   // A worker can outlive the dispatcher that started it, so predecessors on this lane count too.
   const parents = new Set([lane.agentId, ...history.filter((item) => item.laneId === lane.id).map((item) => item.agentId)]);
@@ -594,8 +611,16 @@ async function laneView(
     rulesHash: lane.rulesHash,
     ledger: ledgerInfo(lane.ledgerPath),
     runningWorkers: workerCounts
-      ? [...parents].reduce((sum, parent) => sum + (workerCounts.get(parent) ?? 0), 0)
+      ? [...parents].reduce((sum, parent) => sum + (workerCounts.get(parent)?.length ?? 0), 0)
       : null,
+    running: workerCounts ? [...parents].flatMap((parent) => workerCounts.get(parent) ?? []) : [],
+    events: recentLaneEvents(eventsDir(), lane.id, 8).map((event) => ({
+      at: event.at,
+      kind: event.kind,
+      workerId: event.workerId ?? null,
+      title: event.title ?? null,
+      detail: event.detail ?? null,
+    })),
     pendingHandoff: lane.pendingHandoff
       ? { ...lane.pendingHandoff, written: handoffWritten(lane.pendingHandoff.handoffPath) }
       : null,
@@ -645,8 +670,19 @@ async function renameOldTitles(paseo: PaseoApi, registry: Registry, state: State
   }
 }
 
+/**
+ * Read-only, so it does not queue behind the lock: dispatch_work holds that lock while Paseo creates a session, which
+ * took up to a minute and timed the page's 5-second poll out. Only releasing an archived lane writes, and that takes
+ * the lock briefly.
+ */
 export function overview(paseo: PaseoApi): Promise<Overview> {
-  return exclusive(async () => {
+  return (async () => {
+    const timings: [string, number][] = [];
+    let mark = Date.now();
+    const lap = (label: string) => {
+      timings.push([label, Date.now() - mark]);
+      mark = Date.now();
+    };
     const { registry, problems } = loadRegistry(layout);
     const base = {
       home: layout.home,
@@ -654,6 +690,7 @@ export function overview(paseo: PaseoApi): Promise<Overview> {
       handoffs: listHandoffs(layout),
       checkedAt: new Date().toISOString(),
       watch: watchHealth(),
+      plugin: pluginBuild,
     };
     if (!registry)
       return {
@@ -670,10 +707,21 @@ export function overview(paseo: PaseoApi): Promise<Overview> {
     } catch (error) {
       problems.push(`读取规则原文失败（${rulesPath(layout, registry)}）：${(error as Error).message}`);
     }
-    const state = loadState(layout);
-    await settleArchivedLanes(paseo, registry, state);
+    let state = loadState(layout);
+    lap("读登记与规则");
+    const laneStatuses = await Promise.all(allLanes(state).map(({ lane }) => agentStatus(paseo, lane.agentId)));
+    if (laneStatuses.includes("archived")) {
+      state = await exclusive(async () => {
+        const fresh = loadState(layout);
+        await settleArchivedLanes(paseo, registry, fresh);
+        return fresh;
+      });
+    }
+    lap("核对归档会话线");
     await renameOldTitles(paseo, registry, state);
+    lap("改旧标题");
     const workerCounts = await workerCountsByParent(paseo);
+    lap("在跑工位");
     const dispatchers: DispatcherView[] = await Promise.all(
       registry.dispatchers.map(async (dispatcher) => {
         const entry = stateOf(state, dispatcher.id);
@@ -719,6 +767,9 @@ export function overview(paseo: PaseoApi): Promise<Overview> {
         };
       }),
     );
+    lap("会话线与历史");
+    const total = timings.reduce((sum, [, ms]) => sum + ms, 0);
+    if (total > 1500) logWatch(`总览慢 ${total}ms：${timings.map(([label, ms]) => `${label} ${ms}`).join("，")}`);
     return {
       ...base,
       rulesFile: rulesPath(layout, registry),
@@ -727,7 +778,7 @@ export function overview(paseo: PaseoApi): Promise<Overview> {
       problems,
       dispatchers,
     };
-  });
+  })();
 }
 
 export function sync() {
@@ -1056,6 +1107,25 @@ function noticeTarget(parentAgentId: string): Promise<NoticeTarget | null> {
 
 const watchDir = () => path.dirname(layout.statePath);
 
+const pluginBuild = readPluginBuild(
+  (() => {
+    try {
+      return path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+    } catch {
+      return null;
+    }
+  })(),
+);
+const eventsDir = () => path.join(watchDir(), "events");
+
+function laneEvent(laneId: string, kind: LaneEventKind, fields: { workerId?: string; title?: string | null; detail?: string | null } = {}) {
+  try {
+    appendLaneEvent(eventsDir(), laneId, { at: new Date().toISOString(), kind, ...fields });
+  } catch (error) {
+    logWatch(`记会话线事件失败 ${laneId}：${(error as Error).message}`);
+  }
+}
+
 function logWatch(line: string): void {
   try {
     mkdirSync(watchDir(), { recursive: true });
@@ -1136,6 +1206,23 @@ function watchIo(paseo: PaseoApi): WatchIo {
       };
     },
     findTarget: noticeTarget,
+    openDecisions: async (laneId) => {
+      const lane = allLanes(loadState(layout)).find(({ lane }) => lane.id === laneId)?.lane;
+      if (!lane || !existsSync(lane.ledgerPath)) return [];
+      return summarizeLedger(readFileSync(lane.ledgerPath, "utf8")).decisions.map((item) => item.text);
+    },
+    event: (parentAgentId, event) => {
+      void noticeTarget(parentAgentId)
+        .then((target) => {
+          if (target)
+            laneEvent(target.laneId, event.kind as LaneEventKind, {
+              workerId: event.workerId,
+              title: event.title,
+              detail: event.detail ? event.detail.slice(0, 300) : null,
+            });
+        })
+        .catch(() => undefined);
+    },
     readStatusFile: async (file) => {
       const resolved = expandHome(file);
       return existsSync(resolved) ? readFileSync(resolved, "utf8") : null;
@@ -1250,6 +1337,56 @@ async function autoCleanup(): Promise<void> {
   }
 }
 
+const SLIM_EVERY_MS = 10 * 60_000;
+let lastSlimAt = 0;
+
+/** True only when Paseo says the session is archived or no longer exists; a failed lookup is not an answer. */
+async function sessionFinished(paseo: PaseoApi, agentId: string): Promise<boolean> {
+  try {
+    const result = await paseo.agents.ref(agentId).refresh();
+    return !result || Boolean(result.agent.archivedAt);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The dispatcher reads its whole ledger every turn, and rows the plugin adds were never taken out again. Every 10
+ * minutes, for lanes whose dispatcher is idle, finished sessions' rows, older answered decisions and older completions
+ * move to an archive file next to the ledger. A ledger edited meanwhile is left for the next round.
+ */
+async function slimLedgers(): Promise<void> {
+  if (!watchPaseo || !existsSync(layout.statePath) || Date.now() - lastSlimAt < SLIM_EVERY_MS) return;
+  lastSlimAt = Date.now();
+  const paseo = watchPaseo;
+  const queued = new Set(loadWatch().notices.filter((notice) => notice.kind === "reply").map((notice) => notice.parentAgentId));
+  const lanes = allLanes(loadState(layout))
+    .map(({ lane }) => lane)
+    .filter((lane) => !lane.pendingHandoff && existsSync(lane.ledgerPath));
+  for (const lane of lanes) {
+    if ((await agentStatus(paseo, lane.agentId)) !== "idle") continue;
+    const before = readFileSync(lane.ledgerPath, "utf8");
+    const ids = runningTableAgents(before);
+    const done = await mapLimit(ids, ARCHIVE_CONCURRENCY, (id) => sessionFinished(paseo, id));
+    const archivePath = path.join(path.dirname(lane.ledgerPath), "归档", path.basename(lane.ledgerPath));
+    await exclusive(async () => {
+      const current = readFileSync(lane.ledgerPath, "utf8");
+      if (current !== before) return;
+      const result = slimLedger(current, {
+        finished: new Set(ids.filter((_, index) => done[index])),
+        archiveDecisions: !queued.has(lane.agentId),
+        archivePath,
+      });
+      if (result.archived.length === 0) return;
+      mkdirSync(path.dirname(archivePath), { recursive: true });
+      appendFileSync(archivePath, `\n${archiveBlock(result.archived, new Date())}`);
+      writeAtomic(lane.ledgerPath, result.ledger);
+      const moved = result.archived.map((part) => `${part.heading} ${part.lines.length} 行`).join("，");
+      logWatch(`台账瘦身 ${lane.id}：${moved}，${before.length} → ${result.ledger.length} 字`);
+    });
+  }
+}
+
 let decisionTimer: ReturnType<typeof setInterval> | null = null;
 const decisionClockFile = () => path.join(watchDir(), "decision-clock.json");
 
@@ -1280,6 +1417,7 @@ async function timeOutDecisions(): Promise<void> {
       if (due.recommend.length > 0) {
         writeAtomic(lane.ledgerPath, markDecisions(ledger, due.recommend.map((item) => item.line), "按推荐（10 分钟未答）", new Date(now), "自动"));
         out.push({ laneAgentId: lane.agentId, text: recommendReply(due.recommend) });
+        laneEvent(lane.id, "auto_answered", { detail: `${due.recommend.length} 条 10 分钟未答，按推荐` });
         logWatch(`会话线 ${lane.id} 有 ${due.recommend.length} 条待拍板 10 分钟未答，已按推荐答复`);
       }
       if (due.architect.length > 0) {
@@ -1305,10 +1443,10 @@ export function keepWatching(paseo: PaseoApi): void {
   watchTimer.unref?.();
   cleanupTimer = setInterval(() => void autoCleanup(), CLEANUP_CHECK_MS);
   cleanupTimer.unref?.();
-  decisionTimer = setInterval(
-    () => void timeOutDecisions().catch((error) => logWatch(`待拍板超时检查出错：${(error as Error).message}`)),
-    DECISION_CHECK_MS,
-  );
+  decisionTimer = setInterval(() => {
+    void timeOutDecisions().catch((error) => logWatch(`待拍板超时检查出错：${(error as Error).message}`));
+    void slimLedgers().catch((error) => logWatch(`台账瘦身出错：${(error as Error).message}`));
+  }, DECISION_CHECK_MS);
   decisionTimer.unref?.();
   logWatch("巡检已启动");
   void runWatch(scanWorkers);
@@ -2155,6 +2293,7 @@ export async function answerDecisions(
     if (!found) throw new Error("这条会话线已经不在了");
     const ledger = existsSync(found.ledgerPath) ? readFileSync(found.ledgerPath, "utf8") : "";
     writeAtomic(found.ledgerPath, markDecisions(ledger, input.lines, input.answer, new Date()));
+    laneEvent(found.id, "answered", { detail: `${input.lines.length} 条：${input.answer.trim().slice(0, 120)}` });
     return found;
   });
   const items = input.lines.map((line) => `- ${line.replace(/^\s*(?:[-*]|\d+\.)\s+\[ \]\s*/, "")}`);
@@ -2254,6 +2393,7 @@ export function dispatchWork(paseo: PaseoApi, card: WorkCard, callerAgentId: str
       statusFile: card.statusFile,
     };
     void runWatch(async (state, io) => recordDispatched(state, dispatched, io));
+    laneEvent(found.lane.id, "dispatched", { workerId: agentId, title: card.title });
     // The dispatcher used to write this row itself, and lost it whenever its turn was cut off mid-dispatch.
     let ledgerNote = "把这个会话写进本线台账。";
     try {

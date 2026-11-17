@@ -1,6 +1,7 @@
 import { Pressable, Text, View } from "react-native";
 import type { LaneView } from "../shared/contracts";
 import { Decisions } from "./decisions";
+import { LaneActivity } from "./lane-activity";
 import { Banner, Button, Chip, Glyph, StatusPill, duration, relativeTime, shortId, statusOf, toneColor, useKit } from "./ui";
 
 const HANDOFF_SLOW_MS = 15 * 60_000;
@@ -116,6 +117,8 @@ export function LaneRow({
           <Text style={s.muted}>台账 {lane.ledger.exists ? relativeTime(lane.ledger.updatedAt) : "未生成"}</Text>
         </Pressable>
       </View>
+
+      <LaneActivity lane={lane} openAgent={actions.openAgent} />
 
       <Decisions lane={lane} dispatcherId={dispatcherId} />
 
